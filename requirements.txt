@@ -1,0 +1,9 @@
+# 网关内核运行所需（Windows / Linux NAS 通用）
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27
+SQLAlchemy>=2.0
+aiosqlite>=0.19
+cryptography>=42
+pydantic>=2.6
+websockets>=12

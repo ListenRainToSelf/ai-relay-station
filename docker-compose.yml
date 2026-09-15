@@ -1,0 +1,36 @@
+# 本地 AI 中转站 · docker compose
+#
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose exec airelay python -m airelay --print-token
+#
+# 首次启动后打开 http://<NAS地址>:8000/admin，用下面的令牌登录。
+services:
+  airelay:
+    build: .
+    image: airelay:1.0.0
+    container_name: airelay
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 数据库 / 日志 / 密钥都落在这个目录，换成 NAS 上的实际路径即可
+      - ./data:/data
+    environment:
+      TZ: Asia/Shanghai
+      # 固定管理员令牌（留空则首次启动自动生成，可在日志或 secrets.json 里查）
+      # AIRELAY_ADMIN_TOKEN: 换成你自己的随机串
+      AIRELAY_HOST: 0.0.0.0
+      AIRELAY_PORT: 8000
+      # 想让容器只在内网可达、由 NAS 反代统一入口时，把 ports 改成 "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # 单机小服务，给点资源上限避免 NAS 被拖垮
+    deploy:
+      resources:
+        limits:
+          memory: 512M

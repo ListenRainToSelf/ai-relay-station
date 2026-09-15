@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airelay"
+version = "1.0.0"
+description = "本地 AI 中转站：托盘常驻式大模型 API 聚合中转网关（OpenAI / Anthropic / Gemini 三协议归一化）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+    "SQLAlchemy>=2.0",
+    "aiosqlite>=0.19",
+    "cryptography>=42",
+    "pydantic>=2.6",
+    "websockets>=12",
+]
+
+[project.optional-dependencies]
+desktop = ["pystray>=0.19", "pillow>=10.0"]
+webview = ["pywebview>=5.0"]
+dev = ["pytest>=8.0", "anyio>=4.0"]
+
+[project.scripts]
+airelay = "airelay.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["airelay*"]
+
+[tool.setuptools.package-data]
+airelay = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

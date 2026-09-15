@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>本地 AI 中转站 · 控制台</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 背景层：网格 + 光晕 + 颗粒 -->
+<div class="backdrop" aria-hidden="true">
+  <div class="backdrop__grid"></div>
+  <div class="backdrop__glow"></div>
+  <div class="backdrop__grain"></div>
+</div>
+
+<!-- 登录闸门 -->
+<div class="gate" id="gate" hidden>
+  <form class="gate__card" id="gate-form" autocomplete="off">
+    <div class="gate__mark" aria-hidden="true">
+      <span class="gate__pulse"></span>
+    </div>
+    <p class="micro">本地 AI 中转站</p>
+    <h1 class="gate__title">需要管理员令牌</h1>
+    <p class="gate__hint">
+      当前请求来自非环回地址。令牌可在数据目录的 <code>secrets.json</code> 里找到，
+      也可以在启动日志里看到，或执行 <code>python -m airelay --print-token</code>。
+    </p>
+    <label class="field">
+      <span class="field__label">管理员令牌</span>
+      <input type="password" id="gate-token" placeholder="粘贴令牌后回车" spellcheck="false">
+    </label>
+    <p class="gate__error" id="gate-error" hidden></p>
+    <button class="btn btn--primary btn--block" type="submit">进入控制台</button>
+  </form>
+</div>
+
+<div class="shell" id="shell" hidden>
+
+  <!-- 侧边导航 -->
+  <nav class="rail" id="rail" aria-label="主导航"></nav>
+
+  <div class="stage">
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <div class="topbar__brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="22" height="22">
+            <rect x="1.5" y="1.5" width="29" height="29" rx="8" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".55"/>
+            <path d="M7 12h15m0 0-4-3.4M22 12l-4 3.4" stroke="var(--cyan)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+            <path d="M25 20H10m0 0 4-3.4M10 20l4 3.4" stroke="var(--emerald)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+          </svg>
+        </span>
+        <div class="topbar__names">
+          <strong>本地 AI 中转站</strong>
+          <span class="micro" id="topbar-sub">v—</span>
+        </div>
+      </div>
+
+      <div class="signal" id="signal" title="实时信号">
+        <div class="signal__scope">
+          <svg id="signal-spark" viewBox="0 0 220 40" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <span class="signal__cap" title="每次推送间隔内新增的 token 数">TOKENS Δ / 采样</span>
+        </div>
+        <div class="signal__leds" id="signal-leds"></div>
+      </div>
+
+      <div class="topbar__actions">
+        <div class="copybar" id="copybar">
+          <button class="btn btn--ghost" id="copy-openai" title="复制 OpenAI 兼容基地址">复制基地址</button>
+          <button class="btn btn--ghost" id="copy-console" title="复制控制台地址">复制控制台</button>
+        </div>
+        <button class="btn btn--ghost" id="theme-toggle" title="切换主题" aria-label="切换主题">◐</button>
+      </div>
+    </header>
+
+    <main class="view" id="view" tabindex="-1"></main>
+  </div>
+</div>
+
+<!-- 通用浮层 -->
+<div class="drawer-root" id="drawer-root" hidden>
+  <div class="drawer-scrim" data-close="drawer"></div>
+  <aside class="drawer" role="dialog" aria-modal="true"><div class="drawer__body" id="drawer-body"></div></aside>
+</div>
+
+<div class="modal-root" id="modal-root" hidden>
+  <div class="modal-scrim" data-close="modal"></div>
+  <div class="modal" role="dialog" aria-modal="true">
+    <header class="modal__head">
+      <h2 id="modal-title">—</h2>
+      <button class="iconbtn" data-close="modal" aria-label="关闭">✕</button>
+    </header>
+    <div class="modal__body" id="modal-body"></div>
+    <footer class="modal__foot" id="modal-foot"></footer>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="cmdk" id="cmdk" hidden>
+  <div class="cmdk__box">
+    <input id="cmdk-input" placeholder="跳转：仪表盘 / 渠道 / 密钥 / 统计 / 实时 / 余额 / 设置" spellcheck="false">
+    <ul class="cmdk__list" id="cmdk-list"></ul>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

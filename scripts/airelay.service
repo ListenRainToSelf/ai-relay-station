@@ -1,0 +1,44 @@
+[Unit]
+Description=本地 AI 中转站（AI Relay Gateway）
+Documentation=https://github.com/your-name/airelay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 建议用独立的普通用户跑，不要用 root
+User=airelay
+Group=airelay
+WorkingDirectory=/opt/airelay
+
+# 监听地址与端口也可以只写在控制台的设置里；这里用命令行覆盖便于容器化/多实例
+Environment=AIRELAY_MODE=server
+Environment=AIRELAY_HOST=0.0.0.0
+Environment=AIRELAY_PORT=8000
+Environment=AIRELAY_DATA_DIR=/var/lib/airelay
+
+# 想固定管理员令牌就取消注释（否则从数据目录 secrets.json 读取，首次启动会生成并打印）
+# Environment=AIRELAY_ADMIN_TOKEN=请换成你自己的随机串
+
+ExecStart=/opt/airelay/venv/bin/python -m airelay --mode server
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+# ---------- 安全加固 ----------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/airelay
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=airelay
+
+[Install]
+WantedBy=multi-user.target

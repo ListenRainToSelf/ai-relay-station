@@ -1,0 +1,9 @@
+# Windows / 桌面常驻形态的额外依赖（NAS 无头部署不需要装）
+-r requirements.txt
+
+pystray>=0.19      # 托盘图标
+pillow>=10.0       # 生成托盘图标
+
+# 可选：装了就用内嵌 WebView 窗口，不装则回退到 Edge/Chrome 的 --app 独立窗口。
+# Windows 上 pywebview 需要 pythonnet，如安装失败可直接跳过。
+# pywebview>=5.0
