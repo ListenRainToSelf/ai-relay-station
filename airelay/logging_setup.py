@@ -60,12 +60,14 @@ def setup_logging(
     root.setLevel(numeric)
     root.handlers.clear()
 
-    stream = sys.stdout
-    console = logging.StreamHandler(stream)
-    console.setLevel(numeric)
-    use_color = bool(getattr(stream, "isatty", lambda: False)()) and sys.platform != "win32"
-    console.setFormatter(_ColorFormatter(_FORMAT, _DATEFMT, use_color=use_color))
-    root.addHandler(console)
+    # pythonw（无控制台）下 stdout/stderr 都是 None，此时只有文件日志
+    stream = sys.stdout or sys.stderr
+    if stream is not None:
+        console = logging.StreamHandler(stream)
+        console.setLevel(numeric)
+        use_color = bool(getattr(stream, "isatty", lambda: False)()) and sys.platform != "win32"
+        console.setFormatter(_ColorFormatter(_FORMAT, _DATEFMT, use_color=use_color))
+        root.addHandler(console)
 
     if log_dir is not None:
         try:

@@ -474,30 +474,44 @@ async def stats(
     request: Request,
     hours: float = Query(24.0, gt=0, le=24 * 365),
     bucket: str = Query("hour", pattern="^(hour|day)$"),
-    key_id: str = "",
+    key_id: str = Query("", description="只看某个本地密钥"),
+    model: str = Query("", description="只看某个模型"),
+    group_by: str = Query("", pattern="^(|model)$", description="model = 额外返回按模型拆分的多条序列"),
 ):
+    """统计总览与序列。
+
+    所有聚合都吃同一套筛选条件（时间窗 / 本地密钥 / 模型），
+    这样控制台上的「筛选某个 API Key + 某个模型的折线图」就是同一次请求的结果。
+    """
     ctx = request.app.state.ctx
-    return {
-        "overview": await ctx.usage.overview(hours=hours),
-        "series": await ctx.usage.series(hours=hours, bucket=bucket, key_id=key_id),
-        "by_model": await ctx.usage.by_model(hours=hours, key_id=key_id),
-        "by_key": await ctx.usage.by_key(hours=hours),
-        "by_channel": await ctx.usage.by_channel(hours=hours),
+    payload: dict[str, Any] = {
+        "overview": await ctx.usage.overview(hours=hours, key_id=key_id, model=model),
+        "series": await ctx.usage.series(hours=hours, bucket=bucket, key_id=key_id, model=model),
+        "by_model": await ctx.usage.by_model(hours=hours, key_id=key_id, model=model),
+        "by_key": await ctx.usage.by_key(hours=hours, key_id=key_id, model=model),
+        "by_channel": await ctx.usage.by_channel(hours=hours, key_id=key_id, model=model),
+        "filters": {"hours": hours, "bucket": bucket, "key_id": key_id, "model": model, "group_by": group_by},
+        "options": await ctx.usage.options(hours=hours),
         "pricing": {
             "currency": ctx.pricing.currency,
             "models": ctx.pricing.models,
             "default": ctx.pricing.default,
         },
     }
+    if group_by == "model":
+        payload["series_by_model"] = await ctx.usage.series_by_model(
+            hours=hours, bucket=bucket, key_id=key_id
+        )
+    return payload
 
 
 @router.get("/stats/logs")
 async def usage_logs(
     request: Request,
     limit: int = Query(100, ge=1, le=1000),
-    key_id: str = "",
+    key_id: str = Query("", description="只看某个本地密钥"),
     status: str = "",
-    model: str = "",
+    model: str = Query("", description="只看某个模型"),
 ):
     ctx = request.app.state.ctx
     return {

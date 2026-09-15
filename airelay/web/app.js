@@ -437,7 +437,8 @@ function sparkline(values, options) {
 function areaChart(config) {
   const width = 860;
   const height = config.height || 210;
-  const pad = { top: 14, right: 16, bottom: 24, left: 46 };
+  // 左侧留宽一点：纵轴用精确数字（不缩写），位数可能到 7 位
+  const pad = { top: 14, right: 18, bottom: 24, left: 66 };
   const series = config.series || [];
   const labels = config.labels || [];
   const count = Math.max(1, labels.length);
@@ -453,7 +454,7 @@ function areaChart(config) {
     const yy = y(value);
     return svg('g', null,
       svg('line', { x1: pad.left, x2: width - pad.right, y1: yy, y2: yy }),
-      svg('text', { x: pad.left - 8, y: yy + 3, 'text-anchor': 'end', class: 'chart__axis' }, fmt.compact(value)));
+      svg('text', { x: pad.left - 8, y: yy + 3, 'text-anchor': 'end', class: 'chart__axis' }, fmt.int(value)));
   });
 
   const labelStep = Math.max(1, Math.ceil(count / 8));
@@ -463,7 +464,7 @@ function areaChart(config) {
 
   const groups = series.map((s, index) => {
     const points = s.values.map((v, i) => [x(i), y(v)]);
-    const line = points.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+    const line = points.map((pt, i) => (i ? 'L' : 'M') + pt[0].toFixed(1) + ' ' + pt[1].toFixed(1)).join(' ');
     const gid = 'ag' + index + Math.random().toString(36).slice(2, 7);
     const nodes = [];
     if (s.fill !== false) {
@@ -474,14 +475,78 @@ function areaChart(config) {
       nodes.push(svg('path', { d: line + ` L${x(count - 1)} ${pad.top + plotH} L${x(0)} ${pad.top + plotH} Z`, fill: `url(#${gid})` }));
     }
     nodes.push(svg('path', { d: line, class: 'chart__line', stroke: s.color }));
-    if (count <= 3) nodes.push(...points.map((p) => svg('circle', { cx: p[0], cy: p[1], r: 2.4, fill: s.color })));
     return svg('g', null, nodes);
   });
 
-  return svg('svg', { viewBox: `0 0 ${width} ${height}`, class: 'chart', role: 'img', 'aria-label': config.label || '趋势图' },
+  // ---- 悬停：竖直准星 + 每条线上的焦点圆点（默认隐藏）----
+  const cursor = svg('line', { class: 'chart__cursor', x1: 0, x2: 0, y1: pad.top, y2: pad.top + plotH, style: { display: 'none' } });
+  const focus = series.map(() => svg('circle', { class: 'chart__focus', r: 3.6, style: { display: 'none' } }));
+
+  // ---- 命中带：每个时间点一条不可见的竖条，鼠标进入即显示该点详情 ----
+  const band = count > 1 ? plotW / (count - 1) : plotW;
+  const hits = labels.map((_, i) => svg('rect', {
+    class: 'chart__hit',
+    x: Math.max(pad.left, x(i) - band / 2),
+    y: pad.top,
+    width: Math.min(band, plotW),
+    height: plotH,
+    'data-index': i,
+  }));
+
+  const node = svg('svg', {
+    viewBox: `0 0 ${width} ${height}`, class: 'chart', role: 'img',
+    'aria-label': config.label || '趋势图',
+  },
     svg('g', { class: 'chart__grid' }, ticks),
     ...groups,
-    svg('g', null, xLabels));
+    svg('g', null, xLabels),
+    cursor,
+    svg('g', null, focus),
+    svg('g', { class: 'chart__hits' }, hits));
+
+  const tip = el('div', { class: 'chart__tip', style: { display: 'none' } });
+  const wrap = el('div', { class: 'chart__wrap' }, node, tip);
+
+  const show = (index) => {
+    const cx = x(index);
+    cursor.setAttribute('x1', cx);
+    cursor.setAttribute('x2', cx);
+    cursor.style.display = '';
+    series.forEach((s, si) => {
+      const dot = focus[si];
+      dot.setAttribute('cx', cx);
+      dot.setAttribute('cy', y(s.values[index]));
+      dot.setAttribute('fill', s.color);
+      dot.style.display = '';
+    });
+    const rows = typeof config.tooltip === 'function'
+      ? config.tooltip(index)
+      : series.map((s) => ({ label: s.name || '数值', color: s.color, value: fmt.int(s.values[index]) }));
+    tip.replaceChildren(
+      el('div', { class: 'chart__tip-head', text: (config.tipTitle && config.tipTitle(index)) || labels[index] || '' }),
+      ...rows.map((row) => el('div', { class: 'chart__tip-row' },
+        row.color ? el('i', { style: { background: row.color } }) : null,
+        el('span', { class: 'chart__tip-key', text: row.label }),
+        el('b', { class: 'mono', text: row.value }))));
+    tip.style.display = '';
+    const rendered = node.getBoundingClientRect().width || width;
+    const left = cx * (rendered / width);
+    const maxLeft = Math.max(4, (wrap.clientWidth || rendered) - tip.offsetWidth - 6);
+    tip.style.left = Math.min(Math.max(4, left + 12), maxLeft) + 'px';
+    tip.style.top = '6px';
+  };
+  const hide = () => {
+    cursor.style.display = 'none';
+    focus.forEach((dot) => { dot.style.display = 'none'; });
+    tip.style.display = 'none';
+  };
+
+  hits.forEach((rect, index) => {
+    rect.addEventListener('mouseenter', () => show(index));
+    rect.addEventListener('mousemove', () => show(index));
+  });
+  node.addEventListener('mouseleave', hide);
+  return wrap;
 }
 
 function barList(items, options) {
@@ -492,7 +557,7 @@ function barList(items, options) {
     el('div', { class: 'barlist__name', title: row.name, text: row.name }),
     el('div', { class: 'barlist__track' },
       el('div', { class: 'barlist__fill', style: { width: Math.max(2, ((Number(row.value) || 0) / max) * 100) + '%', background: opts.color ? `linear-gradient(90deg, transparent, ${opts.color})` : undefined } })),
-    el('div', { class: 'barlist__val', text: row.label || fmt.compact(row.value) }))));
+    el('div', { class: 'barlist__val', text: row.label || fmt.int(row.value) }))));
 }
 
 function donut(okCount, errCount) {
@@ -534,6 +599,7 @@ const state = {
   navToken: 0,
   statsWindow: 24,
   statsBucket: 'hour',
+  statsFilter: { keyId: '', model: '', groupBy: '' },
   ws: null,
   wsAttempts: 0,
   pollers: [],
@@ -687,6 +753,162 @@ function applyLive(payload) {
   if (!previous) return;
 }
 
+/* ---- 统计筛选：本地密钥 / 模型 / 维度（合计 or 按模型对比）---- */
+function bucketOf(point) {
+  return point && point.bucket ? point.bucket : '';
+}
+
+function statsBuckets(stats) {
+  if (state.statsFilter.groupBy === 'model' && stats && stats.series_by_model) {
+    return (stats.series_by_model.buckets || []).slice();
+  }
+  return ((stats && stats.series) || []).map(bucketOf);
+}
+
+function bucketLabel(bucket) {
+  if (!bucket) return '';
+  return state.statsBucket === 'hour' ? bucket.slice(11, 16) : bucket.slice(5, 10);
+}
+
+/** 统一的取数入口：视图与轮询都走它，保证筛选条件一致。 */
+async function fetchStats() {
+  const query = new URLSearchParams({ hours: String(state.statsWindow), bucket: state.statsBucket });
+  if (state.statsFilter.keyId) query.set('key_id', state.statsFilter.keyId);
+  if (state.statsFilter.model) query.set('model', state.statsFilter.model);
+  if (state.statsFilter.groupBy) query.set('group_by', state.statsFilter.groupBy);
+  const data = await api.get(`${ADMIN}/stats?${query.toString()}`);
+  state.stats = data;
+  return data;
+}
+
+function statsFilterBar(onChange) {
+  const available = (state.stats && state.stats.options) || { keys: [], models: [] };
+  const keySelect = selectInput(
+    [{ value: '', label: '全部密钥' }].concat(available.keys.map((k) => ({ value: k.key_id, label: k.name }))),
+    state.statsFilter.keyId, { style: { maxWidth: '200px' } });
+  keySelect.addEventListener('change', () => { state.statsFilter.keyId = keySelect.value; onChange(); });
+  const modelSelect = selectInput(
+    [{ value: '', label: '全部模型' }].concat(available.models.map((m) => ({ value: m, label: m }))),
+    state.statsFilter.model, { style: { maxWidth: '200px' } });
+  modelSelect.addEventListener('change', () => { state.statsFilter.model = modelSelect.value; onChange(); });
+  const groupSelect = selectInput(
+    [{ value: '', label: '合计曲线' }, { value: 'model', label: '按模型对比' }],
+    state.statsFilter.groupBy, { style: { maxWidth: '150px' } });
+  groupSelect.addEventListener('change', () => { state.statsFilter.groupBy = groupSelect.value; onChange(); });
+
+  const filtered = state.statsFilter.keyId || state.statsFilter.model;
+  const clear = el('button', {
+    class: 'btn btn--tiny',
+    onclick: () => {
+      state.statsFilter = { keyId: '', model: '', groupBy: state.statsFilter.groupBy };
+      onChange();
+    },
+  }, '清除筛选');
+  const noneLeft = !available.keys.length && !available.models.length;
+  return el('div', { class: 'toolbar' },
+    icon('search', 15),
+    el('span', { class: 'micro', text: '按 API 密钥筛选' }), keySelect,
+    el('span', { class: 'micro', text: '按模型筛选' }), modelSelect,
+    el('span', { class: 'micro', text: '曲线' }), groupSelect,
+    filtered ? chip('已筛选', 'warn') : null,
+    el('div', { class: 'spacer' }),
+    filtered ? clear : null,
+    noneLeft ? el('span', { class: 'panel__hint', text: '窗口内还没有数据，所以没有可选项' }) : null);
+}
+
+function legendFor(items, suffix) {
+  return el('div', { class: 'legend' }, items.map((item) => el('span', null,
+    el('i', { style: { background: item.color } }),
+    item.label + (suffix || ''))));
+}
+
+/** Token 趋势图：合计模式画输入/输出两条，按模型对比模式画每个模型一条。 */
+function tokenChartBlock(stats, options) {
+  const opts = options || {};
+  const buckets = statsBuckets(stats);
+  if (!buckets.length) {
+    return opts.empty || el('p', { class: 'panel__hint', text: '窗口内没有数据' });
+  }
+  const labels = buckets.map(bucketLabel);
+  const tipTitle = (i) => fmt.dt(buckets[i]);
+
+  if (state.statsFilter.groupBy === 'model' && stats.series_by_model) {
+    const group = stats.series_by_model;
+    if (!(group.series || []).length) return opts.empty || el('p', { class: 'panel__hint', text: '窗口内没有数据' });
+    return el('div', { class: 'stack' },
+      legendFor(group.series.map((s) => ({ color: s.color, label: s.model })), ' (tok)'),
+      areaChart({
+        labels,
+        tipTitle,
+        series: group.series.map((s) => ({ name: s.model, color: s.color, values: s.points.map((p) => p.tokens) })),
+        tooltip: (i) => group.series.map((s) => {
+          const cell = s.points[i] || {};
+          return {
+            label: s.model,
+            color: s.color,
+            value: `${fmt.int(cell.tokens || 0)} tok · ${fmt.int(cell.requests || 0)} 次`,
+          };
+        }),
+      }));
+  }
+
+  const rows = stats.series || [];
+  return el('div', { class: 'stack' },
+    el('div', { class: 'legend' },
+      el('span', null, el('i', { style: { background: 'var(--cyan)' } }), '输入 tokens'),
+      el('span', null, el('i', { style: { background: 'var(--emerald)' } }), '输出 tokens')),
+    areaChart({
+      labels,
+      tipTitle,
+      series: [
+        { name: '输入 tokens', color: 'var(--cyan)', values: rows.map((p) => p.prompt_tokens) },
+        { name: '输出 tokens', color: 'var(--emerald)', values: rows.map((p) => p.completion_tokens) },
+      ],
+      tooltip: (i) => {
+        const row = rows[i] || {};
+        return [
+          { label: '输入 tokens', color: 'var(--cyan)', value: fmt.int(row.prompt_tokens || 0) },
+          { label: '输出 tokens', color: 'var(--emerald)', value: fmt.int(row.completion_tokens || 0) },
+          { label: '合计 tokens', value: fmt.int(row.tokens || ((row.prompt_tokens || 0) + (row.completion_tokens || 0))) },
+          { label: '请求数', value: fmt.int(row.requests || 0) },
+          { label: '错误数', value: fmt.int(row.errors || 0) },
+          { label: '费用 (µ$)', value: fmt.int(row.cost_units || 0) },
+        ];
+      },
+    }));
+}
+
+/** 请求/错误趋势图。 */
+function requestChartBlock(stats, options) {
+  const opts = options || {};
+  const buckets = statsBuckets(stats);
+  if (!buckets.length) return opts.empty || el('p', { class: 'panel__hint', text: '窗口内没有数据' });
+  const labels = buckets.map(bucketLabel);
+  const rows = stats.series || [];
+  if (!rows.length) return opts.empty || el('p', { class: 'panel__hint', text: '窗口内没有数据' });
+  return el('div', { class: 'stack' },
+    el('div', { class: 'legend' },
+      el('span', null, el('i', { style: { background: 'var(--amber)' } }), '请求数'),
+      el('span', null, el('i', { style: { background: 'var(--rose)' } }), '错误数')),
+    areaChart({
+      labels,
+      tipTitle: (i) => fmt.dt(buckets[i]),
+      series: [
+        { name: '请求数', color: 'var(--amber)', values: rows.map((p) => p.requests) },
+        { name: '错误数', color: 'var(--rose)', values: rows.map((p) => p.errors), fill: false },
+      ],
+      tooltip: (i) => {
+        const row = rows[i] || {};
+        return [
+          { label: '请求数', color: 'var(--amber)', value: fmt.int(row.requests || 0) },
+          { label: '错误数', color: 'var(--rose)', value: fmt.int(row.errors || 0) },
+          { label: '成功率', value: row.requests ? fmt.pct(100 - (row.errors || 0) / row.requests * 100) : '—' },
+          { label: '合计 tokens', value: fmt.int(row.tokens || 0) },
+        ];
+      },
+    }));
+}
+
 function paintSignal() {
   const spark = $('#signal-spark');
   if (spark) {
@@ -709,7 +931,7 @@ function paintSignal() {
       : '—');
   const items = [
     { key: '活跃', value: String(stats.active || 0), tone: 'live' },
-    { key: '请求', value: fmt.compact(stats.started || 0), tone: 'ok' },
+    { key: '请求', value: fmt.int(stats.started || 0), tone: 'ok' },
     { key: '错误', value: String(stats.errors || 0), tone: (stats.errors || 0) > 0 ? 'err' : 'ok' },
     { key: '速度', value: speedText, tone: 'live' },
   ];
@@ -872,20 +1094,14 @@ function sessionCard(session) {
 
 async function viewDashboard(host, token) {
   const [stats, health] = await Promise.all([
-    api.get(`${ADMIN}/stats?hours=${state.statsWindow}&bucket=${state.statsBucket}`),
+    fetchStats(),
     api.get(`${ADMIN}/health`).catch(() => null),
   ]);
   if (token !== state.navToken) return;
-  state.stats = stats;
   state.health = health;
   state.providers = (state.system && state.system.providers) || state.providers;
 
   const overview = stats.overview || {};
-  const series = stats.series || [];
-  const labels = series.map((point) => state.statsBucket === 'hour'
-    ? point.bucket.slice(11, 16)
-    : point.bucket.slice(5, 10));
-
   const container = el('div', { class: 'stack' });
 
   container.appendChild(el('div', { class: 'view__head' },
@@ -896,35 +1112,33 @@ async function viewDashboard(host, token) {
       windowSegmented((hours) => { state.statsWindow = hours; navigate('dashboard'); }),
       el('button', { class: 'btn', onclick: () => navigate('dashboard') }, icon('refresh', 15), ' 刷新'))));
 
+  container.appendChild(statsFilterBar(() => navigate('dashboard')));
+
   const kpis = el('div', { class: 'grid grid--kpi' },
     kpiCard({ key: '请求数', value: fmt.int(overview.requests), foot: el('span', { text: `${overview.streamed || 0} 次流式` }), index: 0 }),
     kpiCard({ key: '成功率', value: fmt.pct(100 - (overview.error_rate || 0)), unit: '', foot: el('span', { text: `失败 ${overview.errors || 0} 次` }), accent: 'var(--emerald)', index: 1 }),
-    kpiCard({ key: 'Token 总量', value: fmt.compact(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.compact(overview.prompt_tokens)} / 输出 ${fmt.compact(overview.completion_tokens)}` }), index: 2 }),
+    kpiCard({ key: 'Token 总量', value: fmt.int(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.int(overview.prompt_tokens)} / 输出 ${fmt.int(overview.completion_tokens)}` }), index: 2 }),
     kpiCard({ key: '平均首字延迟', value: fmt.ms(overview.avg_first_token_ms), foot: el('span', { text: `平均总耗时 ${fmt.ms(overview.avg_latency_ms)}` }), accent: 'var(--violet)', index: 3 }),
     kpiCard({ key: '平均输出速度', value: overview.avg_speed_tok_s ? overview.avg_speed_tok_s.toFixed(1) : '—', unit: 'tok/s', foot: el('span', { text: '按流式请求统计' }), accent: 'var(--amber)', index: 4 }),
     kpiCard({ key: '预估费用', value: fmt.moneyLabel(stats.pricing && stats.pricing.currency) + fmt.money(overview.cost_units), foot: el('span', { text: `${fmt.int(overview.cost_units)} µ$ · 按已配置单价` }), accent: 'var(--rose)', index: 5 }));
   container.appendChild(kpis);
 
-  const throughput = panel('吞吐趋势', el('div', { class: 'stack' },
-    el('div', { class: 'legend' },
-      el('span', null, el('i', { style: { background: 'var(--cyan)' } }), '输入 tokens'),
-      el('span', null, el('i', { style: { background: 'var(--emerald)' } }), '输出 tokens')),
-    series.length
-      ? areaChart({
-        labels: labels.length ? labels : [''],
-        series: [
-          { color: 'var(--cyan)', values: series.map((p) => p.prompt_tokens) },
-          { color: 'var(--emerald)', values: series.map((p) => p.completion_tokens) },
-        ],
-      })
-      : emptyState('这个时间窗口还没有请求', '在「密钥」页创建一个本地密钥，然后用任意 OpenAI 客户端发一次请求试试。',
-        el('button', { class: 'btn btn--primary', onclick: () => navigate('keys') }, '去创建密钥'))),
-    { actions: el('span', { class: 'panel__hint', text: state.statsBucket === 'hour' ? '按小时聚合' : '按天聚合' }) });
+  const throughput = panel('吞吐趋势', tokenChartBlock(stats, {
+    empty: emptyState('这个时间窗口还没有请求', '在「密钥」页创建一个本地密钥，然后用任意 OpenAI 客户端发一次请求试试。',
+      el('button', { class: 'btn btn--primary', onclick: () => navigate('keys') }, '去创建密钥')),
+  }),
+    {
+      actions: el('span', {
+        class: 'panel__hint',
+        text: (state.statsFilter.groupBy === 'model' ? '按模型对比 · ' : '')
+          + (state.statsBucket === 'hour' ? '按小时聚合' : '按天聚合'),
+      }),
+    });
   container.appendChild(throughput);
 
   const middle = el('div', { class: 'grid grid--3' });
   middle.appendChild(panel('模型分布', (stats.by_model || []).length
-    ? barList(stats.by_model.map((row) => ({ name: row.model, value: row.requests, label: fmt.int(row.requests) + ' 次 · ' + fmt.compact(row.tokens) + ' tok' })))
+    ? barList(stats.by_model.map((row) => ({ name: row.model, value: row.requests, label: fmt.int(row.requests) + ' 次 · ' + fmt.int(row.tokens) + ' tok' })))
     : el('p', { class: 'panel__hint', text: '暂无数据' }), { index: 1 }));
 
   middle.appendChild(panel('渠道分布', (stats.by_channel || []).length
@@ -962,8 +1176,7 @@ async function viewDashboard(host, token) {
 
   host.replaceChildren(container);
   startPoller(async () => {
-    const fresh = await api.get(`${ADMIN}/stats?hours=${state.statsWindow}&bucket=${state.statsBucket}`);
-    state.stats = fresh;
+    await fetchStats();
     paintSignal();
   }, 15000);
 }
@@ -1037,9 +1250,9 @@ function paintLiveView() {
   if (kpis) {
     kpis.replaceChildren(
       kpiCard({ key: '进行中', value: String((live.active || []).length), foot: el('span', { text: `峰值 ${stats.peak_active || 0}` }), accent: 'var(--emerald)', index: 0 }),
-      kpiCard({ key: '累计请求', value: fmt.compact(stats.started || 0), foot: el('span', { text: `完成 ${stats.finished || 0}` }), index: 1 }),
+      kpiCard({ key: '累计请求', value: fmt.int(stats.started || 0), foot: el('span', { text: `完成 ${stats.finished || 0}` }), index: 1 }),
       kpiCard({ key: '累计错误', value: String(stats.errors || 0), accent: 'var(--rose)', foot: el('span', { text: '含上游失败与超时' }), index: 2 }),
-      kpiCard({ key: '累计 Tokens', value: fmt.compact(stats.tokens || 0), foot: el('span', { text: '本进程生命周期' }), accent: 'var(--violet)', index: 3 }));
+      kpiCard({ key: '累计 Tokens', value: fmt.int(stats.tokens || 0), foot: el('span', { text: '本进程生命周期' }), accent: 'var(--violet)', index: 3 }));
   }
   const activeHost = $('[data-role="live-active"]');
   if (activeHost) {
@@ -1495,7 +1708,7 @@ function keyRow(key) {
       ? meter(quota.percent, `${symbol}${fmt.money(quota.used)} / ${symbol}${fmt.money(quota.limit)}`, { left: fmt.pct(quota.percent) })
       : el('span', { class: 'panel__hint', text: `不限 · 已用 ${symbol}${fmt.money(key.quota_used)}` })),
     el('td', null, el('span', { class: 'mono', text: `${key.rpm_limit || '∞'} rpm / ${key.tpm_limit || '∞'} tpm` }),
-      key.ratelimit ? el('div', { class: 'panel__hint', text: `当前窗口 ${key.ratelimit.rpm_used || 0} 次 / ${fmt.compact(key.ratelimit.tpm_used || 0)} tok` }) : null),
+      key.ratelimit ? el('div', { class: 'panel__hint', text: `当前窗口 ${key.ratelimit.rpm_used || 0} 次 / ${fmt.int(key.ratelimit.tpm_used || 0)} tok` }) : null),
     el('td', null, models.length
       ? el('div', { class: 'row' }, models.slice(0, 2).map((model) => chip(model, 'mono')), models.length > 2 ? chip('+' + (models.length - 2), 'off') : null)
       : el('span', { class: 'panel__hint', text: '全部' })),
@@ -1621,7 +1834,7 @@ async function keyDetail(key) {
           el('div', { class: 'panel__hint', text: '它是在「设置 → 安全 → 本地密钥可再次查看」关闭时创建的（或数据目录的主密钥换过）。点上方「重新生成密钥值」即可拿到新明文，配额、限速、模型授权与统计都会保留。' }))),
     el('div', { class: 'grid grid--3' },
       kpiCard({ key: '累计请求', value: fmt.int(totals.requests), index: 0 }),
-      kpiCard({ key: '累计 Tokens', value: fmt.compact(totals.tokens), accent: 'var(--violet)', index: 1 }),
+      kpiCard({ key: '累计 Tokens', value: fmt.int(totals.tokens), accent: 'var(--violet)', index: 1 }),
       kpiCard({ key: '累计费用', value: fmt.money(totals.cost_units) + ' µ$', accent: 'var(--rose)', index: 2 })),
     el('dl', { class: 'kv' },
       el('dt', { text: '密钥 ID' }), el('dd', { text: key.key_id }),
@@ -2037,16 +2250,12 @@ async function removeMap(item) {
 /* ======================================================================== */
 
 async function viewStats(host, token) {
-  const stats = await api.get(`${ADMIN}/stats?hours=${state.statsWindow}&bucket=${state.statsBucket}`);
+  const stats = await fetchStats();
   if (token !== state.navToken) return;
-  state.stats = stats;
   const logs = await api.get(`${ADMIN}/stats/logs?limit=200${state.logFilter.status ? '&status=' + state.logFilter.status : ''}${state.logFilter.model ? '&model=' + encodeURIComponent(state.logFilter.model) : ''}`);
   if (token !== state.navToken) return;
 
   const overview = stats.overview || {};
-  const series = stats.series || [];
-  const labels = series.map((point) => state.statsBucket === 'hour' ? point.bucket.slice(11, 16) : point.bucket.slice(5, 10));
-
   const container = el('div', { class: 'stack' });
   container.appendChild(el('div', { class: 'view__head' },
     el('div', { class: 'view__title' },
@@ -2059,35 +2268,22 @@ async function viewStats(host, token) {
         el('button', { class: state.statsBucket === 'day' ? 'is-active' : '', text: '按天', onclick: () => { state.statsBucket = 'day'; navigate('stats'); } })),
       el('button', { class: 'btn', onclick: exportCsv }, icon('download', 15), ' 导出 CSV'))));
 
+  container.appendChild(statsFilterBar(() => navigate('stats')));
+
   container.appendChild(el('div', { class: 'grid grid--kpi' },
     kpiCard({ key: '请求数', value: fmt.int(overview.requests), foot: el('span', { text: `其中流式 ${overview.streamed || 0}` }), index: 0 }),
     kpiCard({ key: '错误数', value: fmt.int(overview.errors), accent: 'var(--rose)', foot: el('span', { text: '错误率 ' + fmt.pct(overview.error_rate || 0) }), index: 1 }),
-    kpiCard({ key: 'Token 总量', value: fmt.compact(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.compact(overview.prompt_tokens)} · 输出 ${fmt.compact(overview.completion_tokens)}` }), accent: 'var(--violet)', index: 2 }),
+    kpiCard({ key: 'Token 总量', value: fmt.int(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.int(overview.prompt_tokens)} · 输出 ${fmt.int(overview.completion_tokens)}` }), accent: 'var(--violet)', index: 2 }),
     kpiCard({ key: '平均首字', value: fmt.ms(overview.avg_first_token_ms), foot: el('span', { text: '流式首包延迟' }), index: 3 }),
     kpiCard({ key: '平均速度', value: overview.avg_speed_tok_s ? overview.avg_speed_tok_s.toFixed(1) : '—', unit: 'tok/s', accent: 'var(--amber)', index: 4 }),
     kpiCard({ key: '活跃密钥', value: fmt.int(overview.active_keys), foot: el('span', { text: `窗口内出现过用量的密钥` }), index: 5 })));
 
   const chartRow = el('div', { class: 'grid grid--2' });
-  chartRow.appendChild(panel('Token 趋势', series.length
-    ? el('div', { class: 'stack' },
-      el('div', { class: 'legend' },
-        el('span', null, el('i', { style: { background: 'var(--cyan)' } }), '输入'),
-        el('span', null, el('i', { style: { background: 'var(--emerald)' } }), '输出')),
-      areaChart({ labels, series: [
-        { color: 'var(--cyan)', values: series.map((p) => p.prompt_tokens) },
-        { color: 'var(--emerald)', values: series.map((p) => p.completion_tokens) },
-      ] }))
-    : el('p', { class: 'panel__hint', text: '窗口内没有数据' }), { index: 0 }));
-  chartRow.appendChild(panel('请求与错误', series.length
-    ? el('div', { class: 'stack' },
-      el('div', { class: 'legend' },
-        el('span', null, el('i', { style: { background: 'var(--amber)' } }), '请求数'),
-        el('span', null, el('i', { style: { background: 'var(--rose)' } }), '错误数')),
-      areaChart({ labels, series: [
-        { color: 'var(--amber)', values: series.map((p) => p.requests) },
-        { color: 'var(--rose)', values: series.map((p) => p.errors), fill: false },
-      ] }))
-    : el('p', { class: 'panel__hint', text: '窗口内没有数据' }), { index: 1 }));
+  chartRow.appendChild(panel('Token 趋势', tokenChartBlock(stats), {
+    index: 0,
+    actions: el('span', { class: 'panel__hint', text: '鼠标悬停查看该时间点明细' }),
+  }));
+  chartRow.appendChild(panel('请求与错误', requestChartBlock(stats), { index: 1 }));
   container.appendChild(chartRow);
 
   const breakdown = el('div', { class: 'grid grid--3' });
@@ -2096,7 +2292,7 @@ async function viewStats(host, token) {
   ], stats.by_model.map((row) => el('tr', null,
     el('td', { class: 'mono cell-ellip', text: row.model }),
     el('td', { class: 'num mono', text: fmt.int(row.requests) }),
-    el('td', { class: 'num mono', text: fmt.compact(row.tokens) }),
+    el('td', { class: 'num mono', text: fmt.int(row.tokens) }),
     el('td', { class: 'num mono', text: fmt.int(row.cost_units) }))), { flush: true })
     : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 2 }));
   breakdown.appendChild(panel('按密钥', (stats.by_key || []).length ? dataTable([
@@ -2104,7 +2300,7 @@ async function viewStats(host, token) {
   ], stats.by_key.map((row) => el('tr', null,
     el('td', null, el('div', { class: 'tbl__name' }, el('strong', { text: row.name || '（已删除）' }), el('span', { class: 'tbl__sub', text: row.prefix || '' }))),
     el('td', { class: 'num mono', text: fmt.int(row.requests) }),
-    el('td', { class: 'num mono', text: fmt.compact(row.tokens) }))), { flush: true })
+    el('td', { class: 'num mono', text: fmt.int(row.tokens) }))), { flush: true })
     : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 3 }));
   breakdown.appendChild(panel('按渠道', (stats.by_channel || []).length ? dataTable([
     { title: '渠道' }, { title: '请求', align: 'right' }, { title: '速度', align: 'right' }, { title: '延迟', align: 'right' },

@@ -151,11 +151,13 @@ class TrayController:
             title=f"{APP_NAME} v{__version__}",
             menu=menu,
         )
+        log.info("托盘图标已就绪：右键可打开控制台 / 复制地址 / 查看日志 / 退出")
         try:
             self._icon.run()
         except Exception:
             log.exception("托盘启动失败，转为前台运行")
             raise
+        log.info("托盘已退出")
 
     def stop(self) -> None:
         if self._icon is not None:

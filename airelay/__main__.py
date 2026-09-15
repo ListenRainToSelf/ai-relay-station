@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
@@ -29,6 +30,8 @@ from .paths import AppPaths
 from .security import load_or_create_secrets
 from .settings import SETTING_SPECS, SettingsService
 from .version import APP_NAME, __version__
+
+log = logging.getLogger("airelay.cli")
 
 ENV_HOST = "AIRELAY_HOST"
 ENV_PORT = "AIRELAY_PORT"
@@ -141,7 +144,14 @@ def print_banner(ctx: AppContext, *, first_run: bool) -> None:
     ]
     if first_run:
         lines.insert(1, "  （首次启动，已生成数据目录与机密文件）")
-    print("\n".join(lines), flush=True)
+    text = "\n".join(lines)
+    if getattr(sys, "stdout", None) is not None:
+        print(text, flush=True)
+    else:
+        # pythonw / 静默托盘：没有控制台可打印，把同样内容写进日志，方便回看
+        for line in lines:
+            if line.strip():
+                log.info(line.strip())
 
 
 def run_doctor(paths: AppPaths, settings: SettingsService) -> int:
