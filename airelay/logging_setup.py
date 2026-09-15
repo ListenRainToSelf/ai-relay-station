@@ -8,10 +8,40 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 
 _CONFIGURED = False
+_HEADLESS = False
+
+
+def ensure_console_streams() -> bool:
+    """给「没有控制台」的进程兜底标准流，返回是否处于无控制台状态。
+
+    用 pythonw（托盘静默启动）拉起时 ``sys.stdout`` / ``sys.stderr`` 都是 None，
+    而不少库假设它们存在——例如 uvicorn 的日志格式化器会调 ``sys.stdout.isatty()``，
+    直接抛 AttributeError 把宿主线程搞死（现象是「服务启动超时」且看不出原因）。
+    这里把它们接到 os.devnull：语义上「能写但看不见」，日志另有文件 handler。
+    """
+    global _HEADLESS
+    _HEADLESS = getattr(sys, "stdout", None) is None
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8", buffering=1))
+            except OSError:  # pragma: no cover - 极端环境
+                pass
+    if getattr(sys, "stdin", None) is None:
+        try:
+            sys.stdin = open(os.devnull, "r", encoding="utf-8")
+        except OSError:  # pragma: no cover
+            pass
+    return _HEADLESS
+
+
+def is_headless() -> bool:
+    return _HEADLESS
 
 _FORMAT = "%(asctime)s %(levelname)-7s [%(name)s] %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"

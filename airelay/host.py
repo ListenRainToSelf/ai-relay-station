@@ -16,6 +16,7 @@ from typing import Any
 import uvicorn
 
 from .context import AppContext
+from .logging_setup import ensure_console_streams
 from .main import create_app
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ class AppHost:
     def start(self, *, wait: bool = True, timeout: float = 20.0) -> bool:
         if self.running:
             return True
+        # 无控制台（pythonw）时标准流是 None，uvicorn 构造日志配置会崩，这里再兜一次
+        ensure_console_streams()
         self._stop.clear()
         self._rebind.clear()
         self._bind_error = ""
@@ -89,12 +92,22 @@ class AppHost:
 
     # ------------------------------------------------------------------ 线程体
     def _supervise(self) -> None:
+        try:
+            self._supervise_loop()
+        except BaseException:  # 线程里没人接的异常在无控制台时会彻底消失，必须自己记下来
+            log.exception("HTTP 宿主线程异常退出")
+            self._bind_error = self._bind_error or "宿主线程异常退出，详见日志"
+            self._started.set()
+
+    def _supervise_loop(self) -> None:
+        log.debug("宿主线程启动：host=%s port=%s", self._host, self._port)
         while not self._stop.is_set():
             if not self._port_available():
                 self._bind_error = f"端口 {self._port} 已被占用"
                 log.error("%s，服务未能启动", self._bind_error)
                 self._started.set()
                 return
+            log.debug("端口 %s 可用，开始装配应用", self._port)
             app = create_app(self.ctx)
             config = uvicorn.Config(
                 app,
@@ -113,7 +126,7 @@ class AppHost:
             self._server = server
             self._bind_error = ""
             self._started.set()
-            log.info("HTTP 服务已就绪：http://%s:%s", self._host, self._port)
+            log.info("HTTP 服务已就绪：http://%s:%s（等待应用生命周期完成）", self._host, self._port)
             try:
                 server.run()
             except SystemExit as exc:  # 端口占用等启动失败

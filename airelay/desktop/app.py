@@ -42,7 +42,10 @@ class DesktopApp:
     # ------------------------------------------------------------------ 运行
     def run(self) -> int:
         if not self.host.start(wait=True, timeout=25):
-            message = self.host.bind_error or "服务启动超时"
+            message = self.host.bind_error or (
+                "服务启动超时（25s 内没起来）。宿主线程的异常已写入日志，"
+                "可查看数据目录 logs/airelay.log 里的「HTTP 宿主线程异常退出」"
+            )
             log.error("%s", message)
             self._fallback_headless(message)
             return 1

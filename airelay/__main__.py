@@ -25,7 +25,7 @@ from .db import build_engine, build_session_factory, dispose, init_db
 from .desktop import run_desktop, tray_available
 from .desktop.window import find_chromium
 from .host import run_blocking
-from .logging_setup import setup_logging
+from .logging_setup import ensure_console_streams, is_headless, setup_logging
 from .paths import AppPaths
 from .security import load_or_create_secrets
 from .settings import SETTING_SPECS, SettingsService
@@ -145,13 +145,13 @@ def print_banner(ctx: AppContext, *, first_run: bool) -> None:
     if first_run:
         lines.insert(1, "  （首次启动，已生成数据目录与机密文件）")
     text = "\n".join(lines)
-    if getattr(sys, "stdout", None) is not None:
-        print(text, flush=True)
-    else:
+    if is_headless():
         # pythonw / 静默托盘：没有控制台可打印，把同样内容写进日志，方便回看
         for line in lines:
             if line.strip():
                 log.info(line.strip())
+    else:
+        print(text, flush=True)
 
 
 def run_doctor(paths: AppPaths, settings: SettingsService) -> int:
@@ -220,6 +220,9 @@ def run_doctor(paths: AppPaths, settings: SettingsService) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 必须最先做：pythonw / 无控制台时 sys.stdout 是 None，很多库（含 uvicorn 的
+    # 日志格式化器）会直接崩，现象是「服务启动超时」而看不出原因。
+    ensure_console_streams()
     args = build_parser().parse_args(argv)
 
     if args.version:
