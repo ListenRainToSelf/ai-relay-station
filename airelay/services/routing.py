@@ -17,6 +17,7 @@ from typing import Any, Iterable
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..adapters import normalize_provider
+from ..adapters.registry import get_adapter_class
 from ..errors import ErrorCode, RelayError
 from ..models import Channel
 from ..settings import SettingsService
@@ -31,6 +32,21 @@ def channel_serves(channel: Channel, model: str) -> bool:
     if not patterns:
         return True
     return any(fnmatch.fnmatchcase(model, pattern) for pattern in patterns)
+
+
+def channel_capabilities(channel: Channel) -> set[str]:
+    """渠道实际开放的能力 = 协议支持的能力 ∩ 渠道配置（配置为空则取协议默认）。
+
+    只允许「收紧」不允许「放开」：一个只做对话的协议不会因为填了 speech 就真能合成语音。
+    """
+    supported = set(get_adapter_class(channel.provider_type).capabilities)
+    override = set(channel.capability_list())
+    return supported & override if override else supported
+
+
+def channel_supports(channel: Channel, required: Iterable[str]) -> bool:
+    needed = {cap for cap in required if cap}
+    return not needed or needed <= channel_capabilities(channel)
 
 
 def channel_serves_request(channel: Channel, resolved: ResolvedModel) -> bool:
@@ -161,15 +177,18 @@ class Router:
         channels: Iterable[Channel],
         key_id: str = "",
         exclude: Iterable[str] = (),
+        required_capabilities: Iterable[str] = (),
     ) -> SelectionPlan:
         excluded = set(exclude)
         wanted_provider = normalize_provider(resolved.provider) if resolved.provider else ""
         bound_channel = resolved.channel_id
+        required = {cap for cap in required_capabilities if cap}
 
         candidates: list[Channel] = []
         skipped_cooling = 0
         skipped_model = 0
         skipped_provider = 0
+        skipped_capability = 0
 
         for channel in channels:
             if channel.channel_id in excluded:
@@ -185,6 +204,9 @@ class Router:
             if not channel_serves_request(channel, resolved):
                 skipped_model += 1
                 continue
+            if not channel_supports(channel, required):
+                skipped_capability += 1
+                continue
             if self.is_cooling(channel.channel_id):
                 skipped_cooling += 1
                 continue
@@ -192,7 +214,13 @@ class Router:
 
         if not candidates:
             reason = "没有匹配的可用渠道"
-            if skipped_cooling:
+            if skipped_capability:
+                missing = "、".join(sorted(required))
+                reason = (
+                    f"有 {skipped_capability} 个渠道支持该模型但不具备所需能力（{missing}）；"
+                    "可在渠道的「能力」里放开，或换一个支持该能力的渠道"
+                )
+            elif skipped_cooling:
                 reason = f"匹配的 {skipped_cooling} 个渠道正在熔断冷却中"
             elif skipped_model:
                 reason = "没有渠道声明支持该模型（可在渠道的「模型白名单」里放开）"

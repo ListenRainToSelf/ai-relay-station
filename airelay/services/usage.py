@@ -45,6 +45,9 @@ class UsageRecord:
     status: str = "ok"
     error_code: str = ""
     cost_units: int = 0
+    # 非对话能力的计量单位：图片张数 / 字符数 / 音频秒数
+    units: int = 0
+    unit_kind: str = ""
     client_ip: str = ""
     user_agent: str = ""
     ts: datetime = field(default_factory=utcnow)
@@ -88,6 +91,8 @@ class UsageService:
                     status=record.status,
                     error_code=record.error_code,
                     cost_units=record.cost_units,
+                    units=record.units,
+                    unit_kind=record.unit_kind,
                     client_ip=record.client_ip,
                     user_agent=record.user_agent[:255],
                 )
@@ -548,5 +553,7 @@ class UsageService:
             "status": row.status,
             "error_code": row.error_code,
             "cost_units": row.cost_units,
+            "units": row.units or 0,
+            "unit_kind": row.unit_kind or "",
             "client_ip": row.client_ip,
         }

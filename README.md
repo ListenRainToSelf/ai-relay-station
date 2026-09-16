@@ -40,6 +40,8 @@
 | 平台式密钥 | `sk-relay-<前缀>-<随机>`，支持过期、配额、RPM/TPM 限速、模型授权（glob）、启用/停用；**明文加密存库，创建后可随时再次查看与复制** |
 | 密钥可反复复制 | 列表行有「复制明文」、详情里有「显示明文」，取回多少次都行；明文彻底丢失时可「重新生成密钥值」，旧值立即失效而配额与统计保留 |
 | 用量与计费 | 每次请求落明细（时间戳 / tokens / 首字延迟 / 输出速度 / 重试次数 / 状态），另按 key × 模型 × 分钟桶预聚合；可配单价表折算费用 |
+| 多能力（不只对话） | 语音合成 `/v1/audio/speech`、语音识别 `/v1/audio/transcriptions`、图片生成 `/v1/images/generations`；**按能力路由**：TTS 请求不会发给只会对话的渠道 |
+| 多模态 | 对话里可带图片/音频/视频，Gemini 的 inlineData 会映射成 OpenAI 的 `images` / `audio` 字段；模型能力在 `/v1/models` 里可见 |
 | 趋势图筛选与悬停 | 折线图可按**本地密钥**与**模型**筛选、可切换「合计 / 按模型对比」；鼠标悬停在点上显示该时间点的输入/输出/合计 tokens、请求数、错误数与费用；所有数字按精确值显示（不缩写） |
 | 同 Key 并发 | 同一个本地密钥可以并发调用，不串行、不串号；额度统计在并发下仍精确（SQL 层自增），明细逐条落库 |
 | 实时会话 | 进程内活跃请求注册表 + WebSocket 推送：正在跑的请求、已收 tokens、瞬时速度、僵死判定 |
@@ -279,6 +281,91 @@ python -m airelay --set gateway.max_retries=2 --set logs.level=DEBUG   # 临时�
 `airelay.db`（SQLite）、`logs/airelay.log`（滚动日志）、`secrets.json`（主密钥 + 管理员令牌 + 哈希 pepper，权限 0600）。
 
 ---
+
+## 语音、图片与其他模态
+
+网关对外仍然只有一套 OpenAI 兼容协议，但**能力从「对话」扩到了语音与图片**。
+
+### 三个新端点
+
+```bash
+# 语音合成：返回音频文件（wav/mp3 取决于上游）
+curl -sS http://127.0.0.1:8000/v1/audio/speech \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"tts","input":"今天天气不错","voice":"冰糖"}' -o speech.wav
+
+# 语音识别：multipart 上传音频，返回 {"text": "..."}
+curl -sS http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer $KEY" \
+  -F model=asr -F language=zh -F file=@speech.wav
+
+# 图片生成：n 张，返回 b64_json（或上游给的 url）
+curl -sS http://127.0.0.1:8000/v1/images/generations \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"img","prompt":"一只在窗台上打盹的橘猫","n":1}'
+```
+
+### 能力（capabilities）
+
+每个协议声明自己支持哪些能力，渠道可以在此基础上**再收紧**（不能凭空多出协议没有的能力）：
+
+| 能力 | 说明 | 谁有 |
+| --- | --- | --- |
+| `chat` | 文本对话 | 全部 |
+| `vision` | 对话里接受图片输入 | OpenAI 兼容、Claude、Gemini、MiMo |
+| `audio_in` | 对话里接受音频输入 | OpenAI 兼容、Gemini、MiMo |
+| `audio_out` | 对话里返回音频 | OpenAI 兼容、MiMo |
+| `speech` | `/v1/audio/speech` | OpenAI 兼容、Gemini、MiMo |
+| `transcription` | `/v1/audio/transcriptions` | OpenAI 兼容、Gemini、MiMo |
+| `images` | `/v1/images/generations` | OpenAI 兼容、Gemini |
+
+路由会按请求自动推导所需能力（带图片的对话要 `vision`，带音频的要 `audio_in`，声明要音频输出的要
+`audio_out`），不满足的渠道会被跳过并给出可读原因；`/v1/models` 里也能看到每个模型的能力，
+客户端可以据此决定要不要调语音接口。
+
+### 各家上游的实测差异（网关会替你翻译）
+
+同样是「语音合成」，三家上游的实现完全不同，适配器负责抹平：
+
+| 上游 | 语音合成 | 语音识别 | 图片生成 |
+| --- | --- | --- | --- |
+| OpenAI 兼容 | 原生 `POST /audio/speech`，返回音频字节 | 原生 `POST /audio/transcriptions`（multipart） | 原生 `POST /images/generations` |
+| 小米 MiMo | **没有音频端点**，走 `/chat/completions`：把文本放进 **assistant** 消息，音频在 `message.audio.data`（base64 WAV，24kHz） | 同样走 `/chat/completions`，音频放 `input_audio` 块 | 不提供 |
+| Google Gemini | `generateContent` + `responseModalities:["AUDIO"]`，返回**裸 PCM**，网关补 WAV 头 | `generateContent` 带 inlineData 音频，取回复文本 | `generateContent` + `["TEXT","IMAGE"]`；模型名含 `imagen` 的走 `:predict` |
+| Anthropic Claude | 不支持 | 不支持 | 不支持 |
+| DeepSeek | 不支持 | 不支持 | 不支持 |
+
+> **两个容易踩的上游约束**（实测踩到过，已固化进适配器与假上游）：
+> 1. MiMo 的 TTS **必须**有 assistant 消息承载待合成文本，否则 `400 messages must contain an assistant role for TTS model`。
+>    音色只能用它的这套：`mimo_default / 冰糖 / 茉莉 / 苏打 / 白桦 / Mia / Chloe / Milo / Dean`；
+>    常见的 OpenAI 音色名（alloy/nova/…）会被自动映射过去。另外 `mimo-v2.5-tts-voicedesign`
+>    要求在 user 消息里给音色描述，`mimo-v2.5-tts-voiceclone` 需要参考音频。
+> 2. MiMo 的 ASR **不接受** text 内容块，且只能有一个 `input_audio` 块
+>    （`ASR request must not include text parts` / `requires exactly one input_audio part`）；
+>    提示词由上游自己注入，`language` 只能作为顶层字段传。
+
+### 计量与计价
+
+非对话能力没有 token，按各自的单位计量并写进用量明细与图表：
+
+| 能力 | 计量单位 | 明细里的字段 |
+| --- | --- | --- |
+| 语音合成 | 字符数 | `units` + `unit_kind=character` |
+| 语音识别 | 音频秒数（不足一秒算一秒） | `units` + `unit_kind=second` |
+| 图片生成 | 张数 | `units` + `unit_kind=image` |
+
+计价表按同样的口径填（每百万字符 / 每秒 / 每张），例如：
+
+```json
+{
+  "tts-model": {"character": 100},
+  "asr-model": {"second": 0.0002},
+  "img-model": {"image": 0.04}
+}
+```
+
+对话仍按 token 计价（`prompt` / `completion`）。控制台的「用量统计 → 请求明细」会把媒体请求显示成
+`18 字符` / `3 秒` / `2 张`，不再显示成 0 token。
 
 ## 本地服务托管（可选）
 

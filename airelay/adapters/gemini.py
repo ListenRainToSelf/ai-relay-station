@@ -7,15 +7,41 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 
 import httpx
 
-from .base import BaseAdapter, ChatRequest, UpstreamCall, Usage, join_url, openai_chunk
+from .base import (
+    CAP_AUDIO_IN,
+    CAP_CHAT,
+    CAP_IMAGES,
+    CAP_SPEECH,
+    CAP_TRANSCRIPTION,
+    CAP_VISION,
+    UNIT_CHARACTER,
+    UNIT_IMAGE,
+    UNIT_SECOND,
+    BaseAdapter,
+    ChatRequest,
+    UpstreamCall,
+    Usage,
+    join_url,
+    openai_chunk,
+)
 from ..errors import ErrorCode, RelayError
 from ..timeutil import utcnow
+from .media import (
+    ImageRequest,
+    MediaResult,
+    SpeechRequest,
+    TranscriptionRequest,
+    billing_seconds,
+    parse_pcm_mime,
+    pcm_to_wav,
+)
 
 MODELS_SUFFIX = "v1beta/models"
 
@@ -40,6 +66,19 @@ class GeminiAdapter(BaseAdapter):
     supports_balance = False
     requires_max_tokens = True
     has_model_list = True
+    # Gemini：对话（可带图/音频）、TTS、图片生成，以及用 generateContent 做转写
+    capabilities = (CAP_CHAT, CAP_VISION, CAP_AUDIO_IN, CAP_SPEECH, CAP_TRANSCRIPTION, CAP_IMAGES)
+    voices = (
+        "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede",
+        "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    )
+    voice_aliases = {
+        "alloy": "Kore", "echo": "Puck", "fable": "Charon", "onyx": "Fenrir",
+        "nova": "Aoede", "shimmer": "Leda", "coral": "Zephyr", "sage": "Orus",
+        "ash": "Charon", "ballad": "Aoede", "verse": "Puck",
+    }
+    # 默认音色（Gemini 的 TTS 必须显式给 voiceName）
+    default_voice = "Kore"
 
     # ------------------------------------------------------------------ 请求
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -155,11 +194,30 @@ class GeminiAdapter(BaseAdapter):
                         },
                     }
                 )
+        images: list[dict[str, Any]] = []
+        audio: dict[str, Any] | None = None
+        for part in (candidate.get("content") or {}).get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData") or part.get("inline_data")
+            if not isinstance(inline, dict) or not inline.get("data"):
+                continue
+            mime = str(inline.get("mimeType") or inline.get("mime_type") or "")
+            if mime.startswith("image/"):
+                images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{inline['data']}"}})
+            elif mime.startswith("audio/"):
+                audio = {"data": str(inline["data"]), "format": mime.split("/")[-1].split(";")[0]}
+
         message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
         if reasoning_parts:
             message["reasoning_content"] = "".join(reasoning_parts)
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # 多模态输出：按 OpenRouter/xAI 那种约定给 message.images，音频给 message.audio
+        if images:
+            message["images"] = images
+        if audio:
+            message["audio"] = audio
 
         finish = FINISH_REASON_MAP.get(str(candidate.get("finishReason")), "stop")
         if tool_calls and finish == "stop":
@@ -258,6 +316,16 @@ class GeminiAdapter(BaseAdapter):
                             ]
                         }
                     )
+                inline = part.get("inlineData") or part.get("inline_data")
+                if isinstance(inline, dict) and inline.get("data"):
+                    mime = str(inline.get("mimeType") or inline.get("mime_type") or "")
+                    if mime.startswith("image/"):
+                        yield chunk({"images": [
+                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{inline['data']}"}}
+                        ]})
+                    elif mime.startswith("audio/"):
+                        yield chunk({"audio": {"data": str(inline["data"]),
+                                               "format": mime.split("/")[-1].split(";")[0]}})
             if candidate.get("finishReason"):
                 finish_reason = FINISH_REASON_MAP.get(str(candidate["finishReason"]), "stop")
                 if tool_index >= 0 and finish_reason == "stop":
@@ -284,6 +352,173 @@ class GeminiAdapter(BaseAdapter):
             "topped_up": 0.0,
             "raw": payload,
         }
+
+
+    # ---------------------------------------------------------------- 语音合成
+    def _speech_config(self, voice: str) -> dict[str, Any]:
+        return {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+        }
+
+    def build_speech_call(
+        self, request: SpeechRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        text = (request.input or "").strip()
+        if not text:
+            raise RelayError(ErrorCode.BAD_REQUEST, "语音合成的文本不能为空", param="input")
+        voice = self.translate_voice(request.voice) or self.default_voice
+        # Gemini 的 TTS 对「怎么念」敏感，用 instructions 或默认口吻包装一下
+        style = (request.instructions or "").strip() or "请自然地朗读下面这段话"
+        body: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": f"{style}：{text}"}]}],
+            "generationConfig": self._speech_config(voice),
+        }
+        body.update({k: v for k, v in (self.extra_body or {}).items() if not k.startswith("_")})
+        return UpstreamCall(
+            "POST",
+            self._endpoint(upstream_model, "generateContent"),
+            self._headers(),
+            body,
+        )
+
+    def normalize_speech(
+        self, response_bytes: bytes, content_type: str, request: SpeechRequest
+    ) -> MediaResult:
+        try:
+            payload = json.loads(response_bytes.decode("utf-8", "replace"))
+        except ValueError:
+            raise RelayError(ErrorCode.UPSTREAM_ERROR, "语音合成返回的不是 JSON") from None
+        audio_part = _first_inline_data(_first_candidate(payload), prefix="audio/")
+        if not audio_part:
+            raise RelayError(
+                ErrorCode.UPSTREAM_ERROR,
+                "上游没有返回音频（该模型可能不是 TTS 模型；Gemini 需要 gemini-*-tts 之类）",
+            )
+        mime, encoded = audio_part
+        raw = base64.b64decode(encoded)
+        if mime.startswith("audio/l16") or "pcm" in mime.lower():
+            rate, width = parse_pcm_mime(mime)
+            raw = pcm_to_wav(raw, sample_rate=rate, sample_width=width)
+            mime = "audio/wav"
+        usage = self.extract_usage(payload) or Usage()
+        return MediaResult(
+            kind="speech",
+            body=raw,
+            content_type=mime or "audio/wav",
+            usage=usage,
+            units=request.characters,
+            unit_kind=UNIT_CHARACTER,
+            model_echo=request.model,
+            note=f"音色 {self.translate_voice(request.voice) or self.default_voice}",
+        )
+
+    # ---------------------------------------------------------------- 语音识别
+    def build_transcription_call(
+        self, request: TranscriptionRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        if not request.content:
+            raise RelayError(ErrorCode.BAD_REQUEST, "上传的音频内容为空", param="file")
+        mime = request.content_type or _audio_mime(request.filename)
+        prompt = request.prompt or "请把这段音频逐字转写为文本，只输出转写结果。"
+        if request.language:
+            prompt = f"请用{request.language}把这段音频逐字转写为文本，只输出转写结果。"
+        body: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inlineData": {"mimeType": mime, "data": base64.b64encode(request.content).decode("ascii")}},
+                    ],
+                }
+            ],
+            "generationConfig": {"temperature": request.temperature if request.temperature is not None else 0},
+        }
+        return UpstreamCall(
+            "POST", self._endpoint(upstream_model, "generateContent"), self._headers(), body
+        )
+
+    def normalize_transcription(
+        self, payload: dict[str, Any], request: TranscriptionRequest
+    ) -> MediaResult:
+        candidate = _first_candidate(payload)
+        text = "".join(
+            str(part.get("text") or "")
+            for part in (candidate.get("content") or {}).get("parts") or []
+            if isinstance(part, dict)
+        ).strip()
+        seconds = request.audio_seconds
+        usage = self.extract_usage(payload) or Usage()
+        if (request.response_format or "json") in ("text", "srt", "vtt"):
+            return MediaResult(
+                kind="transcription", body=text.encode("utf-8"),
+                content_type="text/plain; charset=utf-8", usage=usage,
+                units=billing_seconds(seconds), unit_kind=UNIT_SECOND, model_echo=request.model,
+            )
+        return MediaResult(
+            kind="transcription", payload={"text": text}, usage=usage,
+            units=billing_seconds(seconds), unit_kind=UNIT_SECOND, model_echo=request.model,
+        )
+
+    # ---------------------------------------------------------------- 图片生成
+    def build_image_call(
+        self, request: ImageRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        prompt = (request.prompt or "").strip()
+        if not prompt:
+            raise RelayError(ErrorCode.BAD_REQUEST, "图片生成的 prompt 不能为空", param="prompt")
+        if "imagen" in upstream_model.lower():
+            suffix = "predict"
+            body: dict[str, Any] = {
+                "instances": [{"prompt": prompt}],
+                "parameters": {"sampleCount": request.n},
+            }
+            if request.size:
+                body["parameters"]["aspectRatio"] = _aspect_ratio(request.size)
+        else:
+            suffix = "generateContent"
+            body = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+            }
+        body.update({k: v for k, v in (self.extra_body or {}).items() if not k.startswith("_")})
+        return UpstreamCall(
+            "POST", self._endpoint(upstream_model, suffix), self._headers(), body
+        )
+
+    def normalize_images(self, payload: dict[str, Any], request: ImageRequest) -> MediaResult:
+        images: list[dict[str, Any]] = []
+        predictions = payload.get("predictions")
+        if isinstance(predictions, list):
+            for item in predictions:
+                encoded = (item or {}).get("bytesBase64Encoded")
+                if encoded:
+                    images.append({"b64_json": encoded})
+        candidate = _first_candidate(payload)
+        for part in (candidate.get("content") or {}).get("parts") or []:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData") or part.get("inline_data")
+            if isinstance(inline, dict) and inline.get("data"):
+                mime = str(inline.get("mimeType") or inline.get("mime_type") or "image/png")
+                if mime.startswith("image/"):
+                    images.append({"b64_json": str(inline["data"])})
+        if not images:
+            raise RelayError(
+                ErrorCode.UPSTREAM_ERROR,
+                "上游没有返回图片（该模型可能不是图片生成模型）",
+                details={"model": request.model},
+            )
+        usage = self.extract_usage(payload) or Usage()
+        return MediaResult(
+            kind="images",
+            payload={"created": int(utcnow().timestamp()), "data": images},
+            usage=usage,
+            units=len(images),
+            unit_kind=UNIT_IMAGE,
+            model_echo=request.model,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +588,7 @@ def convert_contents(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
 
 
 def _content_to_parts(content: Any) -> list[dict[str, Any]]:
+    """OpenAI 的内容块 → Gemini parts（文本 / 图片 / 音频 / 视频都支持）。"""
     if content is None:
         return []
     if isinstance(content, str):
@@ -373,7 +609,65 @@ def _content_to_parts(content: Any) -> list[dict[str, Any]]:
             inline = _inline_image(item.get("image_url") or item)
             if inline:
                 parts.append(inline)
+        elif itype == "input_audio":
+            audio = item.get("input_audio") or {}
+            data = str(audio.get("data") or "")
+            fmt = str(audio.get("format") or "wav").lower()
+            if data:
+                parts.append({"inlineData": {"mimeType": _audio_mime("x." + fmt), "data": data}})
+        elif itype == "audio_url":
+            inline = _inline_media(item.get("audio_url") or item, default_mime="audio/wav")
+            if inline:
+                parts.append(inline)
+        elif itype in {"video_url", "file"}:
+            inline = _inline_media(item.get("video_url") or item.get("file") or item, default_mime="video/mp4")
+            if inline:
+                parts.append(inline)
     return parts
+
+
+def _audio_mime(filename: str) -> str:
+    name = (filename or "").lower()
+    for ext, mime in (
+        (".wav", "audio/wav"), (".mp3", "audio/mp3"), (".m4a", "audio/mp4"),
+        (".aac", "audio/aac"), (".flac", "audio/flac"), (".ogg", "audio/ogg"),
+        (".opus", "audio/opus"), (".webm", "audio/webm"), (".pcm", "audio/l16"),
+    ):
+        if name.endswith(ext):
+            return mime
+    return "audio/wav"
+
+
+def _aspect_ratio(size: str) -> str:
+    mapping = {
+        "1024x1024": "1:1", "512x512": "1:1", "1792x1024": "16:9", "1024x1792": "9:16",
+        "1536x1024": "3:2", "1024x1536": "2:3", "1344x768": "16:9", "768x1344": "9:16",
+    }
+    return mapping.get((size or "").strip().lower(), "1:1")
+
+
+def _inline_media(source: Any, *, default_mime: str) -> dict[str, Any] | None:
+    """data URL → inlineData；普通 URL → fileData。"""
+    url = source if isinstance(source, str) else str((source or {}).get("url") or "")
+    if not url:
+        return None
+    if url.startswith("data:"):
+        header, _, data = url.partition(";base64,")
+        return {"inlineData": {"mimeType": header[5:] or default_mime, "data": data}}
+    return {"fileData": {"fileUri": url, "mimeType": default_mime}}
+
+
+def _first_inline_data(candidate: dict[str, Any], *, prefix: str = "") -> tuple[str, str] | None:
+    """从候选回复里取第一段匹配前缀的 inlineData，返回 (mime, base64)。"""
+    for part in (candidate.get("content") or {}).get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        inline = part.get("inlineData") or part.get("inline_data")
+        if isinstance(inline, dict) and inline.get("data"):
+            mime = str(inline.get("mimeType") or inline.get("mime_type") or "")
+            if not prefix or mime.startswith(prefix):
+                return mime, str(inline["data"])
+    return None
 
 
 def _inline_image(source: Any) -> dict[str, Any] | None:

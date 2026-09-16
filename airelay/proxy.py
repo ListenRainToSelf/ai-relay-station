@@ -28,6 +28,8 @@ from .context import AppContext
 from .errors import ErrorCode, RelayError
 from .models import ApiKey, Channel
 from .security import new_request_id
+from .adapters.base import required_capabilities
+from .adapters.media import ImageRequest, MediaResult, SpeechRequest, TranscriptionRequest
 from .services.live import LiveSession
 from .services.mapping import ResolvedModel
 from .timeutil import utcnow
@@ -111,6 +113,8 @@ class ChatProxy:
             )
         )
 
+        # 带图片/音频的对话请求需要渠道具备对应能力，否则会把内容块悄悄丢掉或上游报错
+        required = required_capabilities("chat", body)
         async with ctx.session_factory() as session:
             channels = await ctx.channels.enabled_channels(session)
             plan = await ctx.router.plan(
@@ -118,6 +122,7 @@ class ChatProxy:
                 resolved=resolved,
                 channels=channels,
                 key_id=key.key_id,
+                required_capabilities=required,
             )
         if plan.empty:
             self.finalize_sync(live, status="error", error_code=ErrorCode.NO_CHANNEL_AVAILABLE)
@@ -644,3 +649,275 @@ def _int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+# =========================================================================== #
+# 媒体请求：语音合成 / 语音识别 / 图片生成
+# =========================================================================== #
+_MEDIA_BUILDERS = {
+    "speech": ("build_speech_call", "normalize_speech"),
+    "transcription": ("build_transcription_call", "normalize_transcription"),
+    "images": ("build_image_call", "normalize_images"),
+}
+
+
+@dataclass
+class PreparedMedia:
+    kind: str
+    request_id: str
+    key: ApiKey
+    request: Any
+    resolved: ResolvedModel
+    channel: Channel
+    adapter: Any
+    attempts: int
+    started_monotonic: float
+    live: LiveSession
+    client_ip: str = ""
+    user_agent: str = ""
+    result: MediaResult | None = None
+
+    @property
+    def latency_ms(self) -> float:
+        return (time.perf_counter() - self.started_monotonic) * 1000.0
+
+
+class MediaProxy:
+    """非对话能力的编排器：同样是「按能力选渠道 + 失败换渠道 + 落库计量」。"""
+
+    KINDS = tuple(_MEDIA_BUILDERS)
+
+    def __init__(self, context: AppContext) -> None:
+        self.ctx = context
+
+    async def execute(
+        self,
+        *,
+        kind: str,
+        request: SpeechRequest | TranscriptionRequest | ImageRequest,
+        body: dict[str, Any] | None,
+        key: ApiKey,
+        client_ip: str = "",
+        user_agent: str = "",
+    ) -> MediaResult:
+        ctx = self.ctx
+        settings = ctx.settings
+        if kind not in _MEDIA_BUILDERS:
+            raise RelayError(ErrorCode.BAD_REQUEST, f"不支持的媒体类型：{kind}")
+        if ctx.http is None:
+            raise RelayError(ErrorCode.INTERNAL_ERROR, "网关尚未完成初始化", status=503)
+
+        build_name, normalize_name = _MEDIA_BUILDERS[kind]
+        resolved = ctx.mapping.resolve(request.model)
+        request_id = new_request_id()
+        started = time.perf_counter()
+        live = ctx.live.start(
+            LiveSession(
+                request_id=request_id,
+                key_id=key.key_id,
+                key_name=key.name,
+                key_prefix=key.prefix,
+                model=request.model,
+                upstream_model=resolved.upstream,
+                client_ip=client_ip,
+                stream=False,
+            )
+        )
+
+        required = required_capabilities(kind, body)
+        async with ctx.session_factory() as session:
+            channels = await ctx.channels.enabled_channels(session)
+            plan = await ctx.router.plan(
+                session, resolved=resolved, channels=channels, key_id=key.key_id,
+                required_capabilities=required,
+            )
+        if plan.empty:
+            ctx.live.finish(request_id, status="error", error_code=ErrorCode.NO_CHANNEL_AVAILABLE)
+            await self._record_failure(
+                kind=kind, request_id=request_id, key=key, resolved=resolved,
+                request=request, code=ErrorCode.NO_CHANNEL_AVAILABLE, attempts=0,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                client_ip=client_ip, user_agent=user_agent,
+            )
+            raise RelayError(ErrorCode.NO_CHANNEL_AVAILABLE, plan.reason or "没有可用渠道")
+
+        max_retries = max(0, settings.get_int("gateway.max_retries", 1))
+        defaults = {"max_tokens": settings.get_int("gateway.default_max_tokens", 4096)}
+        last_error: RelayError | None = None
+        attempt = 0
+
+        for channel in plan.candidates:
+            attempt += 1
+            try:
+                adapter = ctx.channels.adapter_for(channel)
+                call = getattr(adapter, build_name)(request, resolved.upstream, defaults=defaults)
+            except RelayError as exc:
+                last_error = exc
+                if not exc.retryable:
+                    break
+                ctx.router.mark_failure(channel.channel_id, exc.message, retryable=False)
+                continue
+
+            timeout = self._timeout_for(channel)
+            try:
+                upstream = await ctx.http.send(call.to_request(timeout=timeout))
+            except httpx.TimeoutException as exc:
+                last_error = RelayError(ErrorCode.UPSTREAM_TIMEOUT, f"访问上游 {channel.name} 超时：{exc}")
+                ctx.router.mark_failure(channel.channel_id, str(exc))
+                await self._mark_failure_db(channel.channel_id, str(exc))
+                if not self._can_retry(attempt, max_retries, len(plan.candidates)): break
+                continue
+            except httpx.HTTPError as exc:
+                last_error = RelayError(ErrorCode.UPSTREAM_ERROR, f"访问上游 {channel.name} 失败：{exc}")
+                ctx.router.mark_failure(channel.channel_id, str(exc))
+                await self._mark_failure_db(channel.channel_id, str(exc))
+                if not self._can_retry(attempt, max_retries, len(plan.candidates)): break
+                continue
+
+            raw = await upstream.aread()
+            content_type = upstream.headers.get("content-type", "")
+            if upstream.status_code >= 400:
+                error = adapter.translate_error(upstream.status_code, raw)
+                if upstream.status_code in {400, 401, 403, 404, 405, 413, 422}:
+                    error.retryable = False
+                last_error = error
+                ctx.router.mark_failure(channel.channel_id, error.message, retryable=error.retryable)
+                await self._mark_failure_db(channel.channel_id, error.message)
+                if not error.retryable or not self._can_retry(attempt, max_retries, len(plan.candidates)):
+                    break
+                log.info("渠道 %s 返回 %s，换渠道重试", channel.name, upstream.status_code)
+                continue
+
+            ctx.router.mark_success(channel.channel_id, latency_ms=(time.perf_counter() - started) * 1000.0)
+            ctx.router.remember_used(key.key_id, channel.channel_id)
+            asyncio.create_task(self._mark_success_db(channel.channel_id))
+            ctx.live.set_channel(
+                request_id, channel_id=channel.channel_id, channel_name=channel.name,
+                provider_type=channel.provider_type, upstream_model=resolved.upstream,
+            )
+
+            prepared = PreparedMedia(
+                kind=kind, request_id=request_id, key=key, request=request, resolved=resolved,
+                channel=channel, adapter=adapter, attempts=attempt, started_monotonic=started,
+                live=live, client_ip=client_ip, user_agent=user_agent,
+            )
+            if kind == "speech":
+                result = getattr(adapter, normalize_name)(raw, content_type, request)
+            else:
+                payload = ChatProxy._decode_payload(raw, adapter)
+                result = getattr(adapter, normalize_name)(payload, request)
+            result.request_id = request_id
+            result.channel_id = channel.channel_id
+            result.channel_name = channel.name
+            result.provider_type = channel.provider_type
+            prepared.result = result
+            live.attempts = attempt
+            ctx.live.set_units(request_id, units=result.units, unit_kind=result.unit_kind)
+            await self._finalize(prepared, result)
+            return result
+
+        error = last_error or RelayError(ErrorCode.NO_CHANNEL_AVAILABLE, "所有候选渠道均不可用")
+        error.request_id = request_id
+        ctx.live.finish(request_id, status="error", error_code=error.code)
+        await self._record_failure(
+            kind=kind, request_id=request_id, key=key, resolved=resolved, request=request,
+            code=error.code, attempts=attempt,
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            client_ip=client_ip, user_agent=user_agent,
+            channel=plan.candidates[0] if plan.candidates else None,
+        )
+        raise error
+
+    async def _finalize(self, prepared: PreparedMedia, result: MediaResult) -> None:
+        ctx = self.ctx
+        pricing = ctx.pricing
+        price_model = prepared.resolved.requested
+        if price_model not in pricing.models and prepared.resolved.upstream in pricing.models:
+            price_model = prepared.resolved.upstream
+        cost_units = pricing.cost_units(
+            price_model,
+            result.usage.prompt_tokens,
+            result.usage.completion_tokens,
+            unit_kind=result.unit_kind,
+            units=result.units,
+        )
+        ctx.live.finish(
+            prepared.request_id, status="ok", finish_reason="stop", cost_units=cost_units,
+            retention=ctx.settings.get_int("monitoring.recent_limit", 50),
+        )
+        ctx.live.update_usage(
+            prepared.request_id,
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+            source=result.usage.source,
+        )
+        from .services.usage import UsageRecord
+
+        ctx.usage.record_soon(
+            UsageRecord(
+                request_id=prepared.request_id,
+                key_id=prepared.key.key_id, key_name=prepared.key.name, key_prefix=prepared.key.prefix,
+                channel_id=prepared.channel.channel_id, channel_name=prepared.channel.name,
+                provider_type=prepared.channel.provider_type,
+                model=prepared.resolved.requested, upstream_model=prepared.resolved.upstream,
+                prompt_tokens=result.usage.prompt_tokens, completion_tokens=result.usage.completion_tokens,
+                total_tokens=result.usage.total_tokens,
+                latency_ms=prepared.latency_ms, stream=False, attempts=prepared.attempts,
+                status="ok", cost_units=cost_units, units=result.units, unit_kind=result.unit_kind,
+                client_ip=prepared.client_ip, user_agent=prepared.user_agent,
+            )
+        )
+        if ctx.settings.get_bool("logs.access_log", True):
+            log.info(
+                "%s %s | %s → %s | %s %s | %.1fms | ok",
+                prepared.resolved.requested, prepared.kind, prepared.key.name or prepared.key.prefix,
+                prepared.channel.name, result.units,
+                result.unit_kind or "tok", prepared.latency_ms,
+            )
+
+    async def _record_failure(
+        self, *, kind: str, request_id: str, key: ApiKey, resolved: ResolvedModel, request: Any,
+        code: str, attempts: int, latency_ms: float, client_ip: str, user_agent: str,
+        channel: Channel | None = None,
+    ) -> None:
+        from .services.usage import UsageRecord
+
+        self.ctx.usage.record_soon(
+            UsageRecord(
+                request_id=request_id, key_id=key.key_id, key_name=key.name, key_prefix=key.prefix,
+                channel_id=channel.channel_id if channel else "",
+                channel_name=channel.name if channel else "",
+                provider_type=channel.provider_type if channel else "",
+                model=request.model, upstream_model=resolved.upstream,
+                latency_ms=latency_ms, stream=False, attempts=attempts,
+                status="error", error_code=code, client_ip=client_ip, user_agent=user_agent,
+            )
+        )
+
+    def _timeout_for(self, channel: Channel) -> dict[str, float]:
+        settings = self.ctx.settings
+        connect = settings.get_float("gateway.connect_timeout", 15.0)
+        if channel.timeout_seconds:
+            connect = min(connect, float(channel.timeout_seconds))
+        # 图片生成/语音合成比对话慢得多，给足读超时（默认沿用请求总超时）
+        read = settings.get_float("gateway.request_timeout", 600.0)
+        return {"connect": connect, "read": read, "write": connect, "pool": connect}
+
+    @staticmethod
+    def _can_retry(attempt: int, max_retries: int, candidates: int) -> bool:
+        return (attempt - 1) < max_retries and attempt < candidates
+
+    async def _mark_failure_db(self, channel_id: str, message: str) -> None:
+        try:
+            async with self.ctx.session_factory() as session:
+                await self.ctx.channels.mark_failure(session, channel_id, message)
+        except Exception:
+            log.debug("记录渠道失败状态时出错", exc_info=True)
+
+    async def _mark_success_db(self, channel_id: str) -> None:
+        try:
+            async with self.ctx.session_factory() as session:
+                await self.ctx.channels.mark_success(session, channel_id)
+        except Exception:
+            log.debug("记录渠道成功状态时出错", exc_info=True)

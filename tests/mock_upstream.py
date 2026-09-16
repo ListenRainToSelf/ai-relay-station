@@ -9,12 +9,48 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import io
 import json
+import struct
 import time
+import wave
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+
+
+def _tiny_wav(seconds: float = 0.25, rate: int = 24000) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        frames = b"".join(
+            struct.pack("<h", int(2000 * __import__("math").sin(2 * 3.141592653589793 * 440 * i / rate)))
+            for i in range(int(rate * seconds))
+        )
+        handle.writeframes(frames)
+    return buffer.getvalue()
+
+
+def _tiny_pcm(seconds: float = 0.2, rate: int = 24000) -> bytes:
+    """Gemini TTS 那样返回裸 PCM（没有 WAV 头），网关需要自己包壳。"""
+    return b"".join(struct.pack("<h", 1200) for _ in range(int(rate * seconds)))
+
+
+def _tiny_png() -> bytes:
+    """1x1 的透明 PNG，够用来验证图片链路。"""
+    return base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AARAAB/wD0AQAA"
+        "AABJRU5ErkJggg=="
+    )
+
+
+RESULT_TEXT = "这是测试上游的回复。"
+TRANSCRIPT_TEXT = "这是测试转写文本。"
 
 REPLY_TEXT = "你好，这里是测试上游的回复。"
 PROMPT_TOKENS = 11
@@ -28,6 +64,9 @@ STATE: dict[str, Any] = {
     "delay": 0.0,
     "stream_delay": 0.0,
     "stream_chunks": 3,
+    "require_assistant_for_tts": True,   # 模拟 MiMo：TTS 必须把文本放 assistant
+    "tts_voice_validator": True,          # 音色不在清单里就 400
+    "valid_voices": ["mimo_default", "冰糖", "茉莉"],
     "balance": {
         "is_available": True,
         "balance_infos": [
@@ -104,6 +143,70 @@ def create_app() -> FastAPI:
         if failed is not None:
             return failed
         model = body.get("model", "mock-model")
+
+        # 模拟 MiMo：语音合成模型要求在 assistant 消息里给文本，返回 base64 WAV
+        if "tts" in model:
+            messages = body.get("messages") or []
+            assistant = next((m for m in messages if m.get("role") == "assistant"), None)
+            if STATE.get("require_assistant_for_tts") and assistant is None:
+                return JSONResponse(status_code=400, content={
+                    "error": {"code": "400", "message": "Param Incorrect",
+                              "param": "messages must contain an assistant role for TTS model"},
+                })
+            audio_cfg = body.get("audio") or {}
+            voice = str(audio_cfg.get("voice") or "")
+            if voice and voice not in STATE.get("valid_voices", []):
+                return JSONResponse(status_code=400, content={
+                    "error": {"code": "400", "message": "Param Incorrect",
+                              "param": f"Unknown voice: {voice}. Available voices: {STATE.get('valid_voices')}"},
+                })
+            encoded = base64.b64encode(_tiny_wav()).decode()
+            return JSONResponse({
+                "id": "chatcmpl-mock-tts",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                    "role": "assistant", "content": "",
+                    "audio": {"id": "audio_mock", "data": encoded, "format": "wav", "transcript": None},
+                }}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+            })
+
+        # 模拟 MiMo：语音识别模型吃 input_audio 内容块，把转写放在 content 里
+        if "asr" in model:
+            messages = body.get("messages") or []
+            parts = [
+                part
+                for message in messages
+                for part in (message.get("content") or [])
+                if isinstance(message.get("content"), list)
+                for part in [part]
+                if isinstance(part, dict)
+            ]
+            audio_parts = [part for part in parts if part.get("type") == "input_audio"]
+            text_parts = [part for part in parts if part.get("type") == "text"]
+            # 与真实 MiMo 一致：不能带 text 块，且只能有一个音频块
+            if text_parts:
+                return JSONResponse(status_code=400, content={"error": {
+                    "code": "400", "message": "Param Incorrect",
+                    "param": "ASR request must not include text parts; text prompt is injected by the server",
+                }})
+            if len(audio_parts) != 1:
+                return JSONResponse(status_code=400, content={"error": {
+                    "code": "400", "message": "Param Incorrect",
+                    "param": f"ASR requires exactly one input_audio part, found: {len(audio_parts)}",
+                }})
+            return JSONResponse({
+                "id": "chatcmpl-mock-asr",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": TRANSCRIPT_TEXT}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26},
+            })
+
         if body.get("stream"):
             return StreamingResponse(
                 _openai_stream(model, body), media_type="text/event-stream"
@@ -127,6 +230,50 @@ def create_app() -> FastAPI:
         if not auth.startswith("Bearer "):
             return JSONResponse(status_code=401, content={"error": {"message": "缺少 Bearer"}})
         return JSONResponse(STATE["balance"])
+
+
+    # ------------------------------------------------------------------ 语音合成
+    @app.post("/v1/audio/speech")
+    async def openai_speech(request: Request):
+        body = await request.json()
+        failed = await _gate("/v1/audio/speech", body)
+        if failed is not None:
+            return failed
+        audio = _tiny_wav()
+        return Response(content=audio, media_type="audio/wav")
+
+    # ------------------------------------------------------------------ 语音识别
+    @app.post("/v1/audio/transcriptions")
+    async def openai_transcriptions(request: Request):
+        form = await request.form()
+        upload = form.get("file")
+        size = 0
+        filename = ""
+        if upload is not None and hasattr(upload, "read"):
+            payload = await upload.read()
+            size = len(payload)
+            filename = getattr(upload, "filename", "") or ""
+        STATE["calls"].append({
+            "path": "/v1/audio/transcriptions",
+            "body": {"model": str(form.get("model") or ""), "language": str(form.get("language") or ""),
+                     "filename": filename, "size": size},
+            "ts": time.time(),
+        })
+        return JSONResponse({"text": TRANSCRIPT_TEXT})
+
+    # ------------------------------------------------------------------ 图片生成
+    @app.post("/v1/images/generations")
+    async def openai_images(request: Request):
+        body = await request.json()
+        failed = await _gate("/v1/images/generations", body)
+        if failed is not None:
+            return failed
+        count = int(body.get("n") or 1)
+        encoded = base64.b64encode(_tiny_png()).decode()
+        return JSONResponse({
+            "created": int(time.time()),
+            "data": [{"b64_json": encoded, "revised_prompt": body.get("prompt")} for _ in range(count)],
+        })
 
     # ------------------------------------------------------------------ Anthropic
     @app.post("/v1/messages")
@@ -156,7 +303,49 @@ def create_app() -> FastAPI:
         model = model_path.split(":")[0]
         if ":streamGenerateContent" in model_path:
             return StreamingResponse(_gemini_stream(model), media_type="text/event-stream")
+        # 注意：{model_path:path} 是贪婪匹配，:predict 请求也会落到这里，
+        # 所以 imagen 的 predict 必须在同一个处理函数里分流。
+        if ":predict" in model_path:
+            count = int(((body.get("parameters") or {}).get("sampleCount")) or 1)
+            encoded = base64.b64encode(_tiny_png()).decode()
+            return JSONResponse({"predictions": [{"bytesBase64Encoded": encoded} for _ in range(count)]})
+
+        config = body.get("generationConfig") or {}
+        modalities = [str(item).upper() for item in (config.get("responseModalities") or [])]
+        if "AUDIO" in modalities:
+            # 与真实 Gemini 一致：返回裸 PCM，交由网关包成 WAV
+            return JSONResponse({
+                "candidates": [{"content": {"role": "model", "parts": [{
+                    "inlineData": {"mimeType": "audio/L16;codec=pcm;rate=24000",
+                                   "data": base64.b64encode(_tiny_pcm()).decode()},
+                }]}, "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 0, "totalTokenCount": 8},
+            })
+        if "IMAGE" in modalities:
+            return JSONResponse({
+                "candidates": [{"content": {"role": "model", "parts": [
+                    {"text": ""},
+                    {"inlineData": {"mimeType": "image/png",
+                                    "data": base64.b64encode(_tiny_png()).decode()}},
+                ]}, "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 0, "totalTokenCount": 9},
+            })
+        # 带音频输入时当作转写请求
+        has_audio = any(
+            isinstance(part, dict) and (part.get("inlineData") or {}).get("mimeType", "").startswith("audio/")
+            for content in body.get("contents") or []
+            for part in content.get("parts") or []
+            if isinstance(part, dict)
+        )
+        if has_audio:
+            return JSONResponse({
+                "candidates": [{"content": {"role": "model", "parts": [{"text": TRANSCRIPT_TEXT}]},
+                                "finishReason": "STOP", "index": 0}],
+                "usageMetadata": {"promptTokenCount": 15, "candidatesTokenCount": 6, "totalTokenCount": 21},
+            })
         return JSONResponse(_gemini_payload(model))
+
+
 
     @app.get("/v1beta/models")
     async def gemini_models():

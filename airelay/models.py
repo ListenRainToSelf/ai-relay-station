@@ -122,6 +122,9 @@ class Channel(Base, TimestampMixin):
     # 本地进程托管（可选）：启动命令、停止方式、健康检查与自动重启策略。
     # 本机推理服务（如 start.bat 拉起的 llama.cpp）用这里托管，见 services/supervisor.py
     lifecycle: Mapped[str] = mapped_column(Text, default="{}")
+    # 该渠道开放的能力（JSON 数组，如 ["chat","speech"]）；空数组 = 用协议默认。
+    # 只能比协议支持的范围更窄，不能凭空多出协议没有的能力。
+    capabilities: Mapped[str] = mapped_column(Text, default="[]")
     note: Mapped[str] = mapped_column(Text, default="")
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
@@ -154,6 +157,15 @@ class Channel(Base, TimestampMixin):
         except ValueError:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def capability_list(self) -> list[str]:
+        import json
+
+        try:
+            data = json.loads(self.capabilities or "[]")
+        except ValueError:
+            return []
+        return [str(item) for item in data] if isinstance(data, list) else []
 
     def lifecycle_config(self) -> dict[str, Any]:
         """本地进程托管配置（未配置时返回带默认值的字典）。"""
@@ -216,6 +228,9 @@ class UsageLog(Base):
     status: Mapped[str] = mapped_column(String(16), default="ok", index=True)  # ok|error
     error_code: Mapped[str] = mapped_column(String(48), default="")
     cost_units: Mapped[int] = mapped_column(BigInteger, default=0)
+    # 非对话能力的计量：图片张数 / 字符数 / 音频秒数（配合 unit_kind）
+    units: Mapped[int] = mapped_column(Integer, default=0)
+    unit_kind: Mapped[str] = mapped_column(String(16), default="")
     client_ip: Mapped[str] = mapped_column(String(64), default="")
     user_agent: Mapped[str] = mapped_column(String(255), default="")
 

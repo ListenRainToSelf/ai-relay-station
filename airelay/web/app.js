@@ -964,8 +964,21 @@ function kpiCard(config) {
     config.spark ? el('div', { class: 'kpi__spark' }, config.spark) : null);
 }
 
+const UNIT_TEXT = { image: '张', character: '字符', second: '秒' };
+
 function chip(text, kind) {
   return el('span', { class: 'chip ' + (kind ? 'chip--' + kind : ''), text });
+}
+
+/** 渠道的「额外能力」小标签：对话之外的能力才值得单独标出来。 */
+function capabilityChips(channel) {
+  const caps = (channel.effective_capabilities || []).filter((cap) => cap !== 'chat');
+  if (!caps.length && !channel.capabilities) return null;
+  if (!caps.length) return el('div', { class: 'panel__hint', style: { marginTop: '3px' }, text: '仅文本对话' });
+  const labels = { vision: '图片输入', audio_in: '音频输入', audio_out: '音频输出',
+    speech: '语音合成', transcription: '语音识别', images: '图片生成' };
+  return el('div', { class: 'row', style: { marginTop: '3px' } },
+    caps.map((cap) => chip(labels[cap] || cap, 'mono')));
 }
 
 function providerChip(provider) {
@@ -1077,7 +1090,10 @@ function sessionCard(session) {
       el('span', { class: 'session__id', text: session.request_id })),
     el('div', { class: 'session__facts' },
       el('span', { class: 'session__fact' }, '密钥 ', el('b', { text: session.key_name || session.key_prefix || '—' })),
-      el('span', { class: 'session__fact' }, '已收 ', el('b', { text: fmt.int(session.total_tokens) }), ' tok'),
+      session.unit_kind
+        ? el('span', { class: 'session__fact' }, '计量 ',
+          el('b', { text: `${fmt.int(session.units)} ${UNIT_TEXT[session.unit_kind] || session.unit_kind}` }))
+        : el('span', { class: 'session__fact' }, '已收 ', el('b', { text: fmt.int(session.total_tokens) }), ' tok'),
       el('span', { class: 'session__fact' }, '速度 ', el('b', { text: session.speed_tok_s ? session.speed_tok_s.toFixed(1) : '—' })),
       el('span', { class: 'session__fact' }, '首字 ', el('b', { text: fmt.ms(session.first_token_ms) })),
       el('span', { class: 'session__fact' }, done ? '耗时 ' : '已用 ', el('b', { text: session.elapsed_text || fmt.ms(session.elapsed_ms) })),
@@ -1350,7 +1366,8 @@ function channelRow(channel, balance) {
             class: 'chip chip--mono',
             title: channel.lifecycle.command,
           }, '本地托管'))
-        : null)),
+        : null,
+      capabilityChips(channel))),
     el('td', null, providerChip(channel.provider_type)),
     el('td', null, models.length
       ? el('div', { class: 'row' }, models.slice(0, 3).map((model) => chip(model, 'mono')),
@@ -1432,6 +1449,46 @@ function channelForm(channel) {
     auto_restart: toggleInput(!!life.auto_restart),
     stop_on_shutdown: toggleInput(!!life.stop_on_shutdown),
   };
+  // ---- 能力（可选，只能比协议支持的更窄）----
+  const capabilityHost = el('div', { class: 'row', style: { gap: '14px' } });
+  const capabilityState = new Set(Array.isArray(channel && channel.capabilities) ? channel.capabilities : []);
+  const renderCapabilities = (providerType) => {
+    const provider = (state.providers || []).find((item) => item.type === providerType) || {};
+    const supported = provider.capabilities || ['chat'];
+    const labels = provider.capability_labels || supported;
+    capabilityHost.replaceChildren(...supported.map((cap, index) => {
+      const checked = !capabilityState.size || capabilityState.has(cap);
+      const input = el('input', { type: 'checkbox' });
+      input.checked = checked;
+      input.addEventListener('change', () => {
+        // 取消全部勾选没有意义，至少留一个
+        if (!input.checked) {
+          capabilityState.add(cap);
+          capabilityState.delete(cap);
+        }
+        const all = Array.from(capabilityHost.querySelectorAll('input'));
+        const picked = all.filter((node) => node.checked).map((node) => node.dataset.cap);
+        if (!picked.length) {
+          input.checked = true;
+          picked.push(cap);
+        }
+        capabilityState.clear();
+        picked.forEach((item) => capabilityState.add(item));
+      });
+      input.dataset.cap = cap;
+      return el('label', { class: 'toggle', title: cap },
+        input, el('span', { class: 'toggle__track' }), el('span', { text: labels[index] || cap }));
+    }));
+  };
+  const capabilitySection = el('div', { class: 'panel' },
+    el('div', { class: 'panel__head' }, el('h3', { text: '能力（可留空 = 用协议默认）' }),
+      el('div', { class: 'spacer' }),
+      el('span', { class: 'panel__hint', text: '只有勾上的能力才会接这类请求' })),
+    el('div', { class: 'panel__body stack' },
+      capabilityHost,
+      el('p', { class: 'panel__hint', text: '例如：一个只放文本模型的渠道可以把「语音合成」去掉，'
+        + '这样 TTS 请求会去找别的渠道；协议本身不支持的能力不会出现在这里。' })));
+
   const lifecycleSection = el('div', { class: 'panel', style: { '--accent': 'var(--amber)' } },
     el('div', { class: 'panel__head' }, el('h3', { text: '本地进程托管（可选）' }),
       el('div', { class: 'spacer' }),
@@ -1460,9 +1517,12 @@ function channelForm(channel) {
         lifeToggle(lifeInputs.auto_restart, '掉线自动重启'),
         lifeToggle(lifeInputs.stop_on_shutdown, '网关退出时一并关闭'))));
 
+  renderCapabilities(inputs.provider_type.value);
   inputs.provider_type.addEventListener('change', () => {
     const preset = (state.providers.find((item) => item.type === inputs.provider_type.value) || {}).default_base_url || '';
     if (preset && !inputs.base_url.value.trim()) inputs.base_url.value = preset;
+    capabilityState.clear();
+    renderCapabilities(inputs.provider_type.value);
   });
 
   const form = el('div', { class: 'stack' },
@@ -1484,6 +1544,7 @@ function channelForm(channel) {
     el('div', { class: 'formgrid' },
       field('附加请求头（JSON）', inputs.extra_headers),
       field('附加请求体（JSON）', inputs.extra_body)),
+    capabilitySection,
     field('备注', inputs.note),
     lifecycleSection);
 
@@ -1518,6 +1579,10 @@ function channelForm(channel) {
       note: inputs.note.value.trim(),
       status: inputs.status.value,
     };
+    const provider = (state.providers || []).find((item) => item.type === inputs.provider_type.value) || {};
+    const supported = provider.capabilities || ['chat'];
+    const picked = supported.filter((cap) => capabilityState.has(cap));
+    payload.capabilities = (picked.length && picked.length < supported.length) ? picked : [];
     payload.lifecycle = {
       enabled: lifeInputs.enabled.querySelector('input').checked,
       command: lifeInputs.command.value.trim(),
@@ -2324,7 +2389,9 @@ async function viewStats(host, token) {
     el('td', { class: 'mono cell-ellip', text: row.model }),
     el('td', { text: row.key_name || row.key_prefix || '—' }),
     el('td', { text: row.channel_name || '—' }),
-    el('td', { class: 'num mono', text: fmt.int(row.total_tokens) }),
+    el('td', { class: 'num mono', text: row.unit_kind
+      ? `${fmt.int(row.units)} ${UNIT_TEXT[row.unit_kind] || row.unit_kind}`
+      : fmt.int(row.total_tokens) }),
     el('td', { class: 'num mono', text: row.first_token_ms ? fmt.ms(row.first_token_ms) : '—' }),
     el('td', { class: 'num mono', text: row.speed_tok_s ? row.speed_tok_s.toFixed(1) : '—' }),
     el('td', { class: 'num mono', text: fmt.ms(row.latency_ms) }),

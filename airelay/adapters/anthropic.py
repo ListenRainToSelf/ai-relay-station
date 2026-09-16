@@ -16,6 +16,8 @@ from typing import Any, AsyncIterator
 import httpx
 
 from ..adapters.base import (
+    CAP_CHAT,
+    CAP_VISION,
     BaseAdapter,
     ChatRequest,
     UpstreamCall,
@@ -48,6 +50,8 @@ class AnthropicAdapter(BaseAdapter):
     supports_balance = False
     requires_max_tokens = True
     has_model_list = True
+    # Claude 只做对话（能看图，但没有音频输入/输出，也没有图片生成）
+    capabilities = (CAP_CHAT, CAP_VISION)
 
     # ------------------------------------------------------------------ 请求
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:

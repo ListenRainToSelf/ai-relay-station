@@ -7,11 +7,26 @@ OpenAI / DeepSeek / 多数聚合中转都遵循 `/chat/completions`，因此主�
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from ..errors import ErrorCode, RelayError
+from .media import ImageRequest, MediaResult, SpeechRequest, TranscriptionRequest, billing_seconds
 from .base import (
+    CAP_AUDIO_IN,
+    CAP_AUDIO_OUT,
+    CAP_CHAT,
+    CAP_IMAGES,
+    CAP_SPEECH,
+    CAP_TRANSCRIPTION,
+    CAP_VISION,
+    UNIT_CHARACTER,
+    UNIT_IMAGE,
+    UNIT_SECOND,
     BaseAdapter,
+    audio_format_of,
+    build_multipart,
+    detect_audio_container,
     ChatRequest,
     OpenAIPassthroughMixin,
     UpstreamCall,
@@ -42,6 +57,11 @@ class OpenAIAdapter(OpenAIPassthroughMixin, BaseAdapter):
     default_base_url = "https://api.openai.com/v1"
     supports_balance = False
     has_model_list = True
+    # OpenAI 兼容协议把这些端点都定义了；具体上游不一定实现，能力路由会兜住
+    capabilities = (
+        CAP_CHAT, CAP_VISION, CAP_AUDIO_IN, CAP_AUDIO_OUT,
+        CAP_SPEECH, CAP_TRANSCRIPTION, CAP_IMAGES,
+    )
 
     def build_chat_call(
         self, request: ChatRequest, upstream_model: str, *, defaults: dict[str, Any]
@@ -115,6 +135,127 @@ class OpenAIAdapter(OpenAIPassthroughMixin, BaseAdapter):
         return Usage(prompt, completion, total, source="upstream")
 
 
+    # ---------------------------------------------------------------- 语音合成
+    def build_speech_call(
+        self, request: SpeechRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        body: dict[str, Any] = {
+            "model": upstream_model,
+            "input": request.input,
+            "voice": request.voice or "alloy",
+            "response_format": request.response_format or "wav",
+        }
+        if request.speed is not None:
+            body["speed"] = request.speed
+        body.update({k: v for k, v in (self.extra_body or {}).items() if not k.startswith("_")})
+        return UpstreamCall(
+            "POST", join_url(self.base_url, "v1/audio/speech"), self._headers(bearer(self.api_key)), body
+        )
+
+    def normalize_speech(
+        self, response_bytes: bytes, content_type: str, request: SpeechRequest
+    ) -> MediaResult:
+        container, guessed = detect_audio_container(response_bytes)
+        return MediaResult(
+            kind="speech",
+            body=response_bytes,
+            content_type=content_type if content_type and content_type != "application/json" else guessed,
+            units=request.characters,
+            unit_kind=UNIT_CHARACTER,
+            model_echo=request.model,
+            note=f"上游返回 {container}",
+        )
+
+    # ---------------------------------------------------------------- 语音识别
+    def build_transcription_call(
+        self, request: TranscriptionRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        fields = {"model": upstream_model}
+        if request.language:
+            fields["language"] = request.language
+        if request.prompt:
+            fields["prompt"] = request.prompt
+        if request.response_format:
+            fields["response_format"] = request.response_format
+        if request.temperature is not None:
+            fields["temperature"] = str(request.temperature)
+        content, ctype = build_multipart(
+            fields,
+            [("file", request.filename or "audio.wav", request.content, request.content_type or "audio/wav")],
+        )
+        headers = self._headers(bearer(self.api_key))
+        headers["Content-Type"] = ctype
+        return UpstreamCall(
+            "POST", join_url(self.base_url, "v1/audio/transcriptions"), headers, content=content
+        )
+
+    def normalize_transcription(
+        self, payload: dict[str, Any], request: TranscriptionRequest
+    ) -> MediaResult:
+        text = str((payload or {}).get("text") or "")
+        seconds = request.audio_seconds
+        wants_text = (request.response_format or "json") in ("text", "srt", "vtt")
+        if wants_text:
+            return MediaResult(
+                kind="transcription", body=text.encode("utf-8"), content_type="text/plain; charset=utf-8",
+                usage=self.extract_usage(payload) or Usage(), units=billing_seconds(seconds),
+                unit_kind=UNIT_SECOND, model_echo=request.model,
+            )
+        extra = {k: v for k, v in (payload or {}).items() if k != "text"}
+        usage = self.extract_usage(payload)
+        return MediaResult(
+            kind="transcription",
+            payload={"text": text, **extra},
+            usage=usage or Usage(),
+            units=billing_seconds(seconds),
+            unit_kind=UNIT_SECOND,
+            model_echo=request.model,
+        )
+
+    # ---------------------------------------------------------------- 图片生成
+    def build_image_call(
+        self, request: ImageRequest, upstream_model: str, *, defaults: dict[str, Any]
+    ) -> UpstreamCall:
+        body: dict[str, Any] = {
+            "model": upstream_model,
+            "prompt": request.prompt,
+            "n": request.n,
+        }
+        for field_name in ("size", "quality", "style", "response_format"):
+            value = getattr(request, field_name, "")
+            if value:
+                body[field_name] = value
+        body.update({k: v for k, v in (self.extra_body or {}).items() if not k.startswith("_")})
+        return UpstreamCall(
+            "POST", join_url(self.base_url, "v1/images/generations"), self._headers(bearer(self.api_key)), body
+        )
+
+    def normalize_images(self, payload: dict[str, Any], request: ImageRequest) -> MediaResult:
+        items = (payload or {}).get("data")
+        images: list[dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            entry: dict[str, Any] = {}
+            if item.get("b64_json"):
+                entry["b64_json"] = item["b64_json"]
+            if item.get("url"):
+                entry["url"] = item["url"]
+            if item.get("revised_prompt"):
+                entry["revised_prompt"] = item["revised_prompt"]
+            if entry:
+                images.append(entry)
+        usage = self.extract_usage(payload) if isinstance(payload, dict) else None
+        return MediaResult(
+            kind="images",
+            payload={"created": (payload or {}).get("created") or int(time.time()), "data": images},
+            usage=usage or Usage(),
+            units=len(images) or request.n,
+            unit_kind=UNIT_IMAGE,
+            model_echo=request.model,
+        )
+
+
 class DeepSeekAdapter(OpenAIAdapter):
     """DeepSeek：OpenAI 兼容协议 + 官方余额查询接口。"""
 
@@ -122,6 +263,8 @@ class DeepSeekAdapter(OpenAIAdapter):
     label = "DeepSeek"
     default_base_url = "https://api.deepseek.com/v1"
     supports_balance = True
+    # DeepSeek 只提供文本对话（其模型列表里没有音频/图片模型）
+    capabilities = (CAP_CHAT,)
 
     def build_balance_call(self, *, balance_url: str = "", json_path: str = "") -> UpstreamCall | None:
         url = balance_url.strip() or join_url(_api_root(self.base_url), "user/balance")

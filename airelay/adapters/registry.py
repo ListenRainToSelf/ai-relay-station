@@ -11,6 +11,8 @@ from typing import Any
 from .anthropic import AnthropicAdapter
 from .base import BaseAdapter
 from .gemini import GeminiAdapter
+from .base import CAPABILITY_LABELS
+from .mimo import XiaomiMiMoAdapter
 from .openai import DeepSeekAdapter, GenericOpenAIAdapter, OpenAIAdapter
 
 ADAPTERS: dict[str, type[BaseAdapter]] = {
@@ -18,6 +20,7 @@ ADAPTERS: dict[str, type[BaseAdapter]] = {
     DeepSeekAdapter.provider_type: DeepSeekAdapter,
     AnthropicAdapter.provider_type: AnthropicAdapter,
     GeminiAdapter.provider_type: GeminiAdapter,
+    XiaomiMiMoAdapter.provider_type: XiaomiMiMoAdapter,
     GenericOpenAIAdapter.provider_type: GenericOpenAIAdapter,
 }
 
@@ -33,6 +36,9 @@ PROVIDER_ALIASES = {
     "custom": "openai-compatible",
     "compatible": "openai-compatible",
     "ds": "deepseek",
+    "mimo": "xiaomi-mimo",
+    "xiaomi": "xiaomi-mimo",
+    "xiaomimimo": "xiaomi-mimo",
 }
 
 
@@ -70,6 +76,7 @@ def provider_metadata() -> list[dict[str, Any]]:
         "deepseek": "https://api.deepseek.com/v1",
         "anthropic": "https://api.anthropic.com",
         "gemini": "https://generativelanguage.googleapis.com",
+        "xiaomi-mimo": "https://api.xiaomimimo.com/v1",
     }
     items: list[dict[str, Any]] = []
     for key, cls in ADAPTERS.items():
@@ -81,6 +88,10 @@ def provider_metadata() -> list[dict[str, Any]]:
                 "default_base_url": base.get(key, cls.default_base_url),
                 "supports_balance": cls.supports_balance,
                 "requires_max_tokens": cls.requires_max_tokens,
+                # 控制台用这两项渲染「能力」勾选与音色提示
+                "capabilities": list(cls.capabilities),
+                "capability_labels": [CAPABILITY_LABELS.get(c, c) for c in cls.capabilities],
+                "voices": list(cls.voices),
             }
         )
     return items

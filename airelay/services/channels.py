@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..adapters import BaseAdapter, ChatRequest, create_adapter, normalize_provider
+from .routing import channel_capabilities
 from ..errors import ErrorCode, RelayError, bad_request, not_found
 from ..models import Channel
 from ..security import SecretBox
@@ -168,6 +169,21 @@ class ChannelService:
             record.extra_headers = _json_object(payload["extra_headers"], "extra_headers")
         if payload.get("extra_body") is not None:
             record.extra_body = _json_object(payload["extra_body"], "extra_body")
+        if payload.get("capabilities") is not None:
+            from ..adapters.base import normalize_capabilities
+            from ..adapters.registry import get_adapter_class
+
+            provider = normalize_provider(record.provider_type)
+            supported = tuple(get_adapter_class(provider).capabilities)
+            wanted = normalize_capabilities(payload["capabilities"], fallback=supported)
+            unknown = [cap for cap in wanted if cap not in supported]
+            if unknown:
+                raise bad_request(
+                    "该协议不支持这些能力：" + "、".join(unknown)
+                    + "；它支持：" + "、".join(supported),
+                    param="capabilities",
+                )
+            record.capabilities = json.dumps(wanted, ensure_ascii=False)
         if payload.get("lifecycle") is not None:
             from .supervisor import merge_lifecycle
 
@@ -230,6 +246,11 @@ class ChannelService:
             "models": record.model_patterns(),
             "lifecycle": record.lifecycle_config(),
             "managed": record.lifecycle_config()["enabled"],
+            # 配置原始值 + 生效值（生效值 = 协议能力 ∩ 配置）
+            "capabilities": record.capability_list(),
+            "effective_capabilities": sorted(
+                channel_capabilities(record)
+            ),
             "balance_url": record.balance_url,
             "balance_json_path": record.balance_json_path,
             "balance_currency": record.balance_currency,

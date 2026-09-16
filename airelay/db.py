@@ -73,6 +73,13 @@ LIGHT_MIGRATIONS: dict[str, dict[str, str]] = {
     "channels": {
         # 本地进程托管配置（启动命令 / 自动重启等）
         "lifecycle": "TEXT DEFAULT '{}'",
+        # 渠道开放的能力（空 = 用协议默认）
+        "capabilities": "TEXT DEFAULT '[]'",
+    },
+    "usage_logs": {
+        # 非对话能力的计量单位（图片张数 / 字符数 / 音频秒数）
+        "units": "INTEGER DEFAULT 0",
+        "unit_kind": "TEXT DEFAULT ''",
     },
 }
 

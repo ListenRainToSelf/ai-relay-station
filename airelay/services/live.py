@@ -47,6 +47,9 @@ class LiveSession:
     chars: int = 0
     chunks: int = 0
     cost_units: int = 0
+    # 非对话能力（语音合成/识别、图片生成）的计量：张数 / 字符数 / 秒数
+    units: int = 0
+    unit_kind: str = ""
     ended_at: Any = None
 
     # ---------------------------------------------------------------- 派生
@@ -155,6 +158,14 @@ class LiveRegistry:
             session.total_tokens = session.prompt_tokens + session.completion_tokens
         if source:
             session.usage_source = source
+        self._touch()
+
+    def set_units(self, request_id: str, *, units: int, unit_kind: str) -> None:
+        session = self._active.get(request_id)
+        if session is None:
+            return
+        session.units = int(units or 0)
+        session.unit_kind = unit_kind or ""
         self._touch()
 
     def set_channel(

@@ -18,6 +18,169 @@ from ..errors import ErrorCode, RelayError
 
 
 # --------------------------------------------------------------------------- #
+# 能力标识
+#
+# 网关从「只会对话」扩到多能力后，路由必须按能力筛渠道：TTS 请求不能发给只会
+# 对话的渠道，图片生成也不能。适配器声明自己具备哪些能力，渠道可以再收紧。
+# --------------------------------------------------------------------------- #
+CAP_CHAT = "chat"                    # 文本对话
+CAP_VISION = "vision"                # 对话里接受图片输入
+CAP_AUDIO_IN = "audio_in"            # 对话里接受音频输入
+CAP_AUDIO_OUT = "audio_out"          # 对话里返回音频
+CAP_SPEECH = "speech"                # /v1/audio/speech
+CAP_TRANSCRIPTION = "transcription"  # /v1/audio/transcriptions
+CAP_IMAGES = "images"                # /v1/images/generations
+
+ALL_CAPABILITIES: tuple[str, ...] = (
+    CAP_CHAT, CAP_VISION, CAP_AUDIO_IN, CAP_AUDIO_OUT,
+    CAP_SPEECH, CAP_TRANSCRIPTION, CAP_IMAGES,
+)
+
+CAPABILITY_LABELS: dict[str, str] = {
+    CAP_CHAT: "文本对话",
+    CAP_VISION: "图片输入",
+    CAP_AUDIO_IN: "音频输入",
+    CAP_AUDIO_OUT: "音频输出",
+    CAP_SPEECH: "语音合成",
+    CAP_TRANSCRIPTION: "语音识别",
+    CAP_IMAGES: "图片生成",
+}
+
+# 计费单位（非对话能力没有 token，按各自的单位折算）
+UNIT_NONE = ""
+UNIT_IMAGE = "image"
+UNIT_CHARACTER = "character"
+UNIT_SECOND = "second"
+UNIT_LABELS: dict[str, str] = {
+    UNIT_NONE: "—",
+    UNIT_IMAGE: "张",
+    UNIT_CHARACTER: "字符",
+    UNIT_SECOND: "秒",
+}
+
+# 端点 → 所需能力
+ENDPOINT_CAPABILITY: dict[str, str] = {
+    CAP_CHAT: CAP_CHAT,
+    CAP_SPEECH: CAP_SPEECH,
+    CAP_TRANSCRIPTION: CAP_TRANSCRIPTION,
+    CAP_IMAGES: CAP_IMAGES,
+}
+
+_VISION_PART_TYPES = {"image_url", "image"}
+_AUDIO_PART_TYPES = {"input_audio", "audio_url", "audio"}
+
+
+def normalize_capabilities(values: Any, *, fallback: tuple[str, ...] = (CAP_CHAT,)) -> list[str]:
+    """把配置/默认值清洗成合法能力列表（空 = 用 fallback）。"""
+    if not values:
+        return list(fallback)
+    if isinstance(values, str):
+        values = [item.strip() for item in values.replace(chr(10), ",").split(",")]
+    cleaned: list[str] = []
+    for item in values or []:
+        key = str(item).strip().lower()
+        if key in ALL_CAPABILITIES and key not in cleaned:
+            cleaned.append(key)
+    return cleaned or list(fallback)
+
+
+def required_capabilities(kind: str, body: dict[str, Any] | None = None) -> list[str]:
+    """这次请求需要渠道具备哪些能力。
+
+    对话请求会扫一遍消息内容块：带图片就要 vision，带音频就要 audio_in，
+    声明了要音频输出就要 audio_out。这样「给只会文本的渠道发带图请求」会被
+    路由直接筛掉，而不是把图片悄悄丢掉。
+    """
+    if kind != CAP_CHAT:
+        return [ENDPOINT_CAPABILITY.get(kind, CAP_CHAT)]
+    payload = body or {}
+    needed = [CAP_CHAT]
+    for message in payload.get("messages") or []:
+        content = (message or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "")
+            if ptype in _VISION_PART_TYPES:
+                if CAP_VISION not in needed:
+                    needed.append(CAP_VISION)
+            elif ptype in _AUDIO_PART_TYPES:
+                if CAP_AUDIO_IN not in needed:
+                    needed.append(CAP_AUDIO_IN)
+    modalities = payload.get("modalities")
+    if isinstance(modalities, list) and "audio" in modalities and CAP_AUDIO_OUT not in needed:
+        needed.append(CAP_AUDIO_OUT)
+    return needed
+
+
+def build_multipart(
+    fields: dict[str, str], files: list[tuple[str, str, bytes, str]]
+) -> tuple[bytes, str]:
+    """手搓 multipart/form-data。
+
+    所有上游请求统一走 UpstreamCall，用不上 httpx 的 files=，所以直接生成字节体。
+    files 每项是 (字段名, 文件名, 内容, content-type)。
+    """
+    import secrets as _secrets
+
+    boundary = "----airelay" + _secrets.token_hex(12)
+    nl = chr(13) + chr(10)          # 头部文本里的换行
+    nl_bytes = bytes([13, 10])      # 二进制段之间的换行
+    chunks: list[bytes] = []
+
+    for name, value in (fields or {}).items():
+        if value is None or value == "":
+            continue
+        head = (
+            "--" + boundary + nl
+            + 'Content-Disposition: form-data; name="' + name + '"' + nl
+            + nl + str(value) + nl
+        )
+        chunks.append(head.encode("utf-8"))
+
+    for name, filename, payload, content_type in files or []:
+        head = (
+            "--" + boundary + nl
+            + 'Content-Disposition: form-data; name="' + name + '"; filename="' + filename + '"' + nl
+            + "Content-Type: " + (content_type or "application/octet-stream") + nl
+            + nl
+        )
+        chunks.append(head.encode("utf-8"))
+        chunks.append(payload)
+        chunks.append(nl_bytes)
+
+    chunks.append(("--" + boundary + "--" + nl).encode("ascii"))
+    return b"".join(chunks), "multipart/form-data; boundary=" + boundary
+
+
+def detect_audio_container(payload: bytes) -> tuple[str, str]:
+    """从字节头猜音频容器，返回 (format, content_type)。"""
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
+        return "wav", "audio/wav"
+    if payload[:3] == b"ID3" or payload[:2] in (bytes([255, 251]), bytes([255, 243])):
+        return "mp3", "audio/mpeg"
+    if payload[:4] == b"OggS":
+        return "ogg", "audio/ogg"
+    if payload[:4] == b"fLaC":
+        return "flac", "audio/flac"
+    if payload[:4] == bytes([26, 69, 223, 163]):
+        return "webm", "audio/webm"
+    return "wav", "audio/wav"
+
+
+def audio_format_of(filename: str, content_type: str) -> str:
+    """从文件名/类型推音频格式，用于告诉上游「这是 mp3 还是 wav」。"""
+    text = (filename or "").lower()
+    ctype = (content_type or "").lower()
+    for fmt in ("wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "webm", "pcm"):
+        if text.endswith("." + fmt) or fmt in ctype:
+            return "m4a" if fmt in ("m4a", "aac") else fmt
+    return "wav"
+
+
+# --------------------------------------------------------------------------- #
 # URL 拼接
 # --------------------------------------------------------------------------- #
 _VERSION_SEGMENTS = ("v1beta", "v1")
@@ -223,15 +386,16 @@ class UpstreamCall:
     headers: dict[str, str]
     json_body: dict[str, Any] | None = None
     params: dict[str, str] | None = None
+    # 原始字节体：语音识别要 multipart 上传，二进制回包也要能带出去；有它时忽略 json_body
+    content: bytes | None = None
 
     def to_request(self, timeout: dict[str, float] | None = None) -> httpx.Request:
-        request = httpx.Request(
-            self.method,
-            self.url,
-            headers=self.headers,
-            json=self.json_body,
-            params=self.params,
-        )
+        kwargs: dict[str, Any] = {"headers": self.headers, "params": self.params}
+        if self.content is not None:
+            kwargs["content"] = self.content
+        elif self.json_body is not None:
+            kwargs["json"] = self.json_body
+        request = httpx.Request(self.method, self.url, **kwargs)
         if timeout:
             request.extensions["timeout"] = dict(timeout)
         return request
@@ -248,6 +412,12 @@ class BaseAdapter:
     supports_balance: bool = False
     # 该协议是否要求显式 max_tokens
     requires_max_tokens: bool = False
+    # 该协议默认具备的能力；渠道可以在此基础上再收紧
+    capabilities: tuple[str, ...] = (CAP_CHAT,)
+    # 可用音色（供控制台提示与参数校验）；空表示不校验
+    voices: tuple[str, ...] = ()
+    # 常见 OpenAI 音色名 → 本厂商音色名
+    voice_aliases: dict[str, str] = {}
 
     def __init__(
         self,
@@ -318,6 +488,52 @@ class BaseAdapter:
         elif status >= 500:
             relay_status = 502
         return RelayError(code, message, status=relay_status, details={"upstream_status": status})
+
+    # ---------------------------------------------------------------- 能力
+    def supports_capability(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+    def translate_voice(self, voice: str) -> str:
+        """把客户端给的音色名翻译成本厂商的；未知则给出可用清单而不是硬猜。"""
+        name = (voice or "").strip()
+        if not self.voices:
+            return name
+        if name in self.voices:
+            return name
+        if name.lower() in self.voice_aliases:
+            return self.voice_aliases[name.lower()]
+        if not name:
+            return self.voices[0]
+        raise RelayError(
+            ErrorCode.BAD_REQUEST,
+            "音色 " + name + " 不可用；该渠道支持：" + ", ".join(self.voices),
+            param="voice",
+        )
+
+    # ---------------------------------------------------------------- 媒体能力
+    # 默认实现表示「不支持」：正常路径会被能力路由拦下，这里只做兜底。
+    def _unsupported(self, what: str) -> RelayError:
+        return RelayError(
+            ErrorCode.NO_CHANNEL_AVAILABLE, self.label + " 渠道不支持" + what, status=503
+        )
+
+    def build_speech_call(self, request: Any, upstream_model: str, *, defaults: dict[str, Any]) -> UpstreamCall:
+        raise self._unsupported("语音合成")
+
+    def normalize_speech(self, response_bytes: bytes, content_type: str, request: Any) -> Any:
+        raise self._unsupported("语音合成")
+
+    def build_transcription_call(self, request: Any, upstream_model: str, *, defaults: dict[str, Any]) -> UpstreamCall:
+        raise self._unsupported("语音识别")
+
+    def normalize_transcription(self, payload: dict[str, Any], request: Any) -> Any:
+        raise self._unsupported("语音识别")
+
+    def build_image_call(self, request: Any, upstream_model: str, *, defaults: dict[str, Any]) -> UpstreamCall:
+        raise self._unsupported("图片生成")
+
+    def normalize_images(self, payload: dict[str, Any], request: Any) -> Any:
+        raise self._unsupported("图片生成")
 
     # ---------------------------------------------------------------- 工具
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:

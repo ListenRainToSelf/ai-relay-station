@@ -209,7 +209,9 @@ def _specs() -> dict[str, SettingSpec]:
         ),
         SettingSpec(
             "pricing.models", "pricing", "模型单价表", TYPE_JSON, {},
-            "形如 {\"模型\": {\"prompt\": 每百万输入单价, \"completion\": 每百万输出单价}}；未列出的模型按 0 计。",
+            "形如 {\"模型\": {\"prompt\": 每百万输入单价, \"completion\": 每百万输出单价, "
+            "\"image\": 每张图片单价, \"character\": 每百万字符单价, \"second\": 每秒音频单价}}；"
+            "对话按 token 计，语音合成按字符、语音识别按音频秒数、图片按张数计；未列出的模型按 0 计。",
         ),
         SettingSpec(
             "pricing.default", "pricing", "默认单价", TYPE_JSON, {"prompt": 0.0, "completion": 0.0},
@@ -548,7 +550,9 @@ class PricingTable:
 
     currency: str = "USD"
     models: dict[str, dict[str, float]] = field(default_factory=dict)
-    default: dict[str, float] = field(default_factory=lambda: {"prompt": 0.0, "completion": 0.0})
+    default: dict[str, float] = field(
+        default_factory=lambda: {"prompt": 0.0, "completion": 0.0, "image": 0.0, "character": 0.0, "second": 0.0}
+    )
 
     @classmethod
     def from_settings(cls, settings: SettingsService) -> "PricingTable":
@@ -562,6 +566,10 @@ class PricingTable:
                 cleaned[str(name)] = {
                     "prompt": _safe_float(price.get("prompt")),
                     "completion": _safe_float(price.get("completion")),
+                    # 非对话能力的单价（可选）
+                    "image": _safe_float(price.get("image")),
+                    "character": _safe_float(price.get("character")),
+                    "second": _safe_float(price.get("second")),
                 }
         return cls(
             currency=settings.get_str("pricing.currency", "USD"),
@@ -577,12 +585,31 @@ class PricingTable:
             return self.models[model]
         return self.default
 
-    def cost_units(self, model: str | None, prompt_tokens: int, completion_tokens: int) -> int:
-        """返回以 µ$ 为单位的整数成本。"""
+    def cost_units(
+        self,
+        model: str | None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        *,
+        unit_kind: str = "",
+        units: int = 0,
+    ) -> int:
+        """按用量算成本（µ$）。
+
+        对话按 token；语音合成按字符、语音识别按音频秒数、图片按张数——
+        各家的单价键分别是 prompt/completion、character、second、image。
+        """
         price = self.unit_prices(model)
-        usd = (prompt_tokens / 1_000_000.0) * price.get("prompt", 0.0) + (
-            completion_tokens / 1_000_000.0
-        ) * price.get("completion", 0.0)
+        if unit_kind == "image":
+            usd = units * price.get("image", 0.0)
+        elif unit_kind == "character":
+            usd = (units / 1_000_000.0) * price.get("character", 0.0)
+        elif unit_kind == "second":
+            usd = units * price.get("second", 0.0)
+        else:
+            usd = (prompt_tokens / 1_000_000.0) * price.get("prompt", 0.0) + (
+                completion_tokens / 1_000_000.0
+            ) * price.get("completion", 0.0)
         return int(round(usd * 1_000_000))
 
     @staticmethod
