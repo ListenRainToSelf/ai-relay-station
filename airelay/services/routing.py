@@ -178,11 +178,14 @@ class Router:
         key_id: str = "",
         exclude: Iterable[str] = (),
         required_capabilities: Iterable[str] = (),
+        preferred_capabilities: Iterable[str] = (),
     ) -> SelectionPlan:
         excluded = set(exclude)
         wanted_provider = normalize_provider(resolved.provider) if resolved.provider else ""
         bound_channel = resolved.channel_id
         required = {cap for cap in required_capabilities if cap}
+        # 偏好能力只影响排序：满足的排前面，不满足的照样能接（避免把带图对话整条挡死）
+        preferred = {cap for cap in preferred_capabilities if cap} - required
 
         candidates: list[Channel] = []
         skipped_cooling = 0
@@ -228,7 +231,21 @@ class Router:
                 reason = "没有渠道提供该协议类型"
             return SelectionPlan(resolved, [], reason)
 
-        ordered = self._order(candidates)
+        if preferred:
+            # 先按「是否满足偏好能力」分组，组内仍走优先级 + 权重
+            full = [c for c in candidates if channel_supports(c, preferred)]
+            partial = [c for c in candidates if c not in full]
+            if full:
+                ordered = self._order(full) + self._order(partial) if partial else self._order(full)
+            else:
+                ordered = self._order(candidates)
+                if candidates:
+                    log.info(
+                        "没有渠道具备偏好能力 %s，仍按普通渠道下发（由上游决定如何处理）",
+                        "、".join(sorted(preferred)),
+                    )
+        else:
+            ordered = self._order(candidates)
         sticky_id = self._sticky_pick(key_id)
         if sticky_id:
             for position, channel in enumerate(ordered):

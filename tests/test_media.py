@@ -326,8 +326,13 @@ async def test_chat_with_image_requires_vision_capability(client, ctx, mock_upst
     assert response.headers["x-airelay-channel-id"] == visual["channel_id"]
 
 
-async def test_chat_with_image_and_no_vision_channel_is_rejected(client, ctx, mock_upstream) -> None:
-    await create_channel(
+async def test_chat_with_image_falls_back_to_text_channel(client, ctx, mock_upstream) -> None:
+    """只有纯文本渠道时，带图片的对话也必须能发出去（图片支持只是偏好，不是硬门槛）。
+
+    这是真实踩过的坑：把 vision 当硬门槛会让「上下文里带截图的会话」整条 503，
+    客户端表现成「重连中」。
+    """
+    only_text = await create_channel(
         ctx, name="只有文本", provider_type="deepseek", base_url=mock_upstream,
         models=["m"], capabilities=["chat"],
     )
@@ -335,12 +340,13 @@ async def test_chat_with_image_and_no_vision_channel_is_rejected(client, ctx, mo
     payload = {
         "model": "m",
         "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看看这张图"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
         ]}],
     }
     response = await client.post(CHAT, json=payload, headers=auth_header(key))
-    assert response.status_code == 503
-    assert "视觉" in response.json()["error"]["message"] or "能力" in response.json()["error"]["message"]
+    assert response.status_code == 200, response.text
+    assert response.headers["x-airelay-channel-id"] == only_text["channel_id"]
 
 
 async def test_chat_with_audio_input_routes_to_audio_capable_channel(client, ctx, mock_upstream) -> None:
@@ -411,3 +417,14 @@ async def test_models_endpoint_exposes_capabilities(client, ctx, mock_upstream) 
     assert "speech" in by_id["mimo-v2.5-tts"]["capabilities"]
     assert "transcription" in by_id["mimo-v2.5-asr"]["capabilities"]
     assert by_id["deepseek-chat"]["capabilities"] == ["chat"]
+
+
+async def test_speech_still_hard_gated_for_text_only_channel(client, ctx, mock_upstream) -> None:
+    """偏好可以放宽，但专用端点的硬门槛不能放宽：TTS 不该流向纯文本渠道。"""
+    await create_channel(
+        ctx, name="只有文本", provider_type="deepseek", base_url=mock_upstream,
+        models=["m"], capabilities=["chat"],
+    )
+    _, key = await create_key(ctx, name="硬门槛", model_allowed=["*"])
+    response = await client.post(SPEECH, json={"model": "m", "input": "x"}, headers=auth_header(key))
+    assert response.status_code == 503

@@ -319,9 +319,19 @@ curl -sS http://127.0.0.1:8000/v1/images/generations \
 | `transcription` | `/v1/audio/transcriptions` | OpenAI 兼容、Gemini、MiMo |
 | `images` | `/v1/images/generations` | OpenAI 兼容、Gemini |
 
-路由会按请求自动推导所需能力（带图片的对话要 `vision`，带音频的要 `audio_in`，声明要音频输出的要
-`audio_out`），不满足的渠道会被跳过并给出可读原因；`/v1/models` 里也能看到每个模型的能力，
-客户端可以据此决定要不要调语音接口。
+路由分两级，**这一点很关键**：
+
+| 级别 | 包含 | 行为 |
+| --- | --- | --- |
+| **硬门槛** | 端点自身的能力（对话要 `chat`、TTS 要 `speech`、图片要 `images`、识别要 `transcription`） | 不满足的渠道直接排除，避免把请求发给不可能处理的渠道 |
+| **偏好** | 对话里的输入/输出模态（`vision` / `audio_in` / `audio_out`） | 满足的渠道**排在前面**，没有的话请求照样下发，由上游决定怎么处理 |
+
+> 为什么模态只做偏好？因为把「带图片」当成硬门槛会**误伤真实会话**：一个纯文本渠道的模型
+> （如 DeepSeek）收到带截图的消息时，以前是转发过去让上游判断，现在会被网关直接判成
+> `NO_CHANNEL_AVAILABLE`，客户端表现成「重连中」。实测 DeepSeek 自己会对图片给出明确校验错误
+> （`messages[0].image[0]: You have uploaded an unsupported image`），这比网关凭空拒绝有用得多。
+
+`/v1/models` 里能看到每个模型的能力，客户端可以据此决定要不要调语音接口。
 
 ### 各家上游的实测差异（网关会替你翻译）
 

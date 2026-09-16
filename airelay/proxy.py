@@ -28,7 +28,7 @@ from .context import AppContext
 from .errors import ErrorCode, RelayError
 from .models import ApiKey, Channel
 from .security import new_request_id
-from .adapters.base import required_capabilities
+from .adapters.base import preferred_capabilities, required_capabilities
 from .adapters.media import ImageRequest, MediaResult, SpeechRequest, TranscriptionRequest
 from .services.live import LiveSession
 from .services.mapping import ResolvedModel
@@ -113,8 +113,10 @@ class ChatProxy:
             )
         )
 
-        # 带图片/音频的对话请求需要渠道具备对应能力，否则会把内容块悄悄丢掉或上游报错
+        # 对话只要 chat 这一个硬门槛；带图片/音频只是「偏好」——
+        # 没有 vision 渠道时也不能把请求挡死（兼容上游可能自己会处理图片块）
         required = required_capabilities("chat", body)
+        preferred = preferred_capabilities("chat", body)
         async with ctx.session_factory() as session:
             channels = await ctx.channels.enabled_channels(session)
             plan = await ctx.router.plan(
@@ -123,6 +125,7 @@ class ChatProxy:
                 channels=channels,
                 key_id=key.key_id,
                 required_capabilities=required,
+                preferred_capabilities=preferred,
             )
         if plan.empty:
             self.finalize_sync(live, status="error", error_code=ErrorCode.NO_CHANNEL_AVAILABLE)

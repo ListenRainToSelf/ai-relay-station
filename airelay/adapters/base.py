@@ -84,17 +84,26 @@ def normalize_capabilities(values: Any, *, fallback: tuple[str, ...] = (CAP_CHAT
     return cleaned or list(fallback)
 
 
-def required_capabilities(kind: str, body: dict[str, Any] | None = None) -> list[str]:
-    """这次请求需要渠道具备哪些能力。
+# 输入/输出模态属于「偏好」：能满足最好，不能也不该把请求挡掉
+PREFERRED_CAPABILITIES: tuple[str, ...] = (CAP_VISION, CAP_AUDIO_IN, CAP_AUDIO_OUT)
 
-    对话请求会扫一遍消息内容块：带图片就要 vision，带音频就要 audio_in，
-    声明了要音频输出就要 audio_out。这样「给只会文本的渠道发带图请求」会被
-    路由直接筛掉，而不是把图片悄悄丢掉。
+
+def preferred_capabilities(kind: str, body: dict[str, Any] | None = None) -> list[str]:
+    """这次请求「最好具备」的能力。
+
+    对话里带了图片就偏好 vision 渠道、带了音频就偏好 audio_in、声明要音频输出就偏好 audio_out。
+    这些**只是偏好**：没有对应渠道时请求照样下发，由上游决定怎么处理——
+    绝不能让「上下文里带了一张截图」把整条对话判成无法路由。
     """
     if kind != CAP_CHAT:
-        return [ENDPOINT_CAPABILITY.get(kind, CAP_CHAT)]
+        return []
     payload = body or {}
-    needed = [CAP_CHAT]
+    wanted: list[str] = []
+
+    def note(capability: str) -> None:
+        if capability not in wanted:
+            wanted.append(capability)
+
     for message in payload.get("messages") or []:
         content = (message or {}).get("content")
         if not isinstance(content, list):
@@ -104,15 +113,24 @@ def required_capabilities(kind: str, body: dict[str, Any] | None = None) -> list
                 continue
             ptype = str(part.get("type") or "")
             if ptype in _VISION_PART_TYPES:
-                if CAP_VISION not in needed:
-                    needed.append(CAP_VISION)
+                note(CAP_VISION)
             elif ptype in _AUDIO_PART_TYPES:
-                if CAP_AUDIO_IN not in needed:
-                    needed.append(CAP_AUDIO_IN)
+                note(CAP_AUDIO_IN)
     modalities = payload.get("modalities")
-    if isinstance(modalities, list) and "audio" in modalities and CAP_AUDIO_OUT not in needed:
-        needed.append(CAP_AUDIO_OUT)
-    return needed
+    if isinstance(modalities, list) and "audio" in modalities:
+        note(CAP_AUDIO_OUT)
+    return wanted
+
+
+def required_capabilities(kind: str, body: dict[str, Any] | None = None) -> list[str]:
+    """这次请求的**硬门槛**：缺了它请求就没有意义。
+
+    只有端点自身的能力算硬门槛——TTS 端点要 speech、图片端点要 images、对话要 chat。
+    输入/输出模态不算（见 preferred_capabilities）。
+    """
+    if kind == CAP_CHAT:
+        return [CAP_CHAT]
+    return [ENDPOINT_CAPABILITY.get(kind, CAP_CHAT)]
 
 
 def build_multipart(
