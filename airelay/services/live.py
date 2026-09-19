@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -18,6 +19,9 @@ from ..timeutil import humanize_seconds, to_iso, utcnow
 log = logging.getLogger(__name__)
 
 RECENT_CAPACITY = 200
+
+# tick 帧的最小间隔：流式每个块都会触发一次状态变化，不限流就变成刷屏
+TICK_MIN_INTERVAL_SECONDS = 0.2
 
 
 @dataclass
@@ -107,6 +111,7 @@ class LiveRegistry:
         self._recent: deque[dict[str, Any]] = deque(maxlen=RECENT_CAPACITY)
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._revision = 0
+        self._last_tick_at = 0.0
         self._total_started = 0
         self._total_finished = 0
         self._total_errors = 0
@@ -299,16 +304,28 @@ class LiveRegistry:
                     pass
 
     def _touch(self) -> None:
+        """标记状态有变化。
+
+        `_revision` 每次都要自增（广播循环靠它判断「有没有变化」），但 tick 帧要
+        节流：活跃会话每收到一个流式块都会走到这里，一次长回答就是上千次，全推给
+        订阅者等于拿无用帧去挤占事件循环与浏览器。控制台的实时面板本来就走
+        「按固定间隔推完整快照」，tick 只是轻量提示，攒到间隔再发不影响观感。
+        """
         self._revision += 1
-        if self._subscribers:
-            self.publish(
-                {
-                    "type": "tick",
-                    "rev": self._revision,
-                    "active": len(self._active),
-                    "ts": to_iso(utcnow()),
-                }
-            )
+        if not self._subscribers:
+            return
+        now = time.monotonic()
+        if now - self._last_tick_at < TICK_MIN_INTERVAL_SECONDS:
+            return
+        self._last_tick_at = now
+        self.publish(
+            {
+                "type": "tick",
+                "rev": self._revision,
+                "active": len(self._active),
+                "ts": to_iso(utcnow()),
+            }
+        )
 
     async def broadcast_loop(
         self,

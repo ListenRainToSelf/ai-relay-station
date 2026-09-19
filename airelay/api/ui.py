@@ -9,15 +9,43 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(tags=["控制台"])
-
 CONSOLE_PATH = "/admin"
 NO_CACHE = {"Cache-Control": "no-store, must-revalidate"}
+ASSET_PLACEHOLDER = "{{ASSET_V}}"
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """控制台静态资源每次都回源校验。
+
+    `/admin` 返回的 HTML 已经是 no-store，但 app.js / style.css 走 StaticFiles
+    默认不带任何缓存指令，浏览器会按「启发式新鲜度」自己缓存上几小时。网关升级或
+    重启之后，控制台窗口可能还在跑旧的 app.js——表现出来就是「界面加载不出来」。
+    加上 no-cache（仍可缓存，但每次带 ETag 回源校验，没变就是 304）即可根治。
+    """
+
+    async def get_response(self, path: str, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
+
+def _asset_stamp(web_dir: Path) -> str:
+    """静态资源版本号：取前端文件的修改时间。
+
+    HTML 每次都重新取，于是资源 URL 里的版本号一变，浏览器必然重新下载，
+    不会出现「新后端配旧前端」这种最难查的组合。
+    """
+    newest = 0.0
+    for name in ("app.js", "style.css"):
+        path = web_dir / name
+        if path.is_file():
+            newest = max(newest, path.stat().st_mtime)
+    return str(int(newest))
 
 
 def _index_path(web_dir: Path | None) -> Path | None:
@@ -28,22 +56,29 @@ def _index_path(web_dir: Path | None) -> Path | None:
 
 
 def mount_console(app, web_dir: Path | None) -> None:
-    """挂载静态目录；找不到前端文件时给出可读的提示页。"""
-    if web_dir is not None and web_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
+    """挂载静态目录；找不到前端文件时给出可读的提示页。
 
-    @router.get("/", include_in_schema=False)
+    路由每次新建：模块级路由是共享对象，被挂两次就会留下两条同路径的处理器，
+    先注册的那条永远优先——测试里同时存在多个 app 时就会出现「清理逻辑不生效」
+    这类莫名其妙的顺序依赖。
+    """
+    router = APIRouter(include_in_schema=False)
+    if web_dir is not None and web_dir.is_dir():
+        app.mount("/static", NoCacheStaticFiles(directory=str(web_dir)), name="static")
+
+    @router.get("/")
     async def root() -> RedirectResponse:
         return RedirectResponse(url=CONSOLE_PATH)
 
-    @router.get("/admin", include_in_schema=False)
+    @router.get("/admin")
     async def console(request: Request):
         index = _index_path(web_dir)
         if index is None:
             return HTMLResponse(_missing_page(), status_code=503)
-        return FileResponse(index, media_type="text/html; charset=utf-8", headers=NO_CACHE)
+        html = index.read_text(encoding="utf-8").replace(ASSET_PLACEHOLDER, _asset_stamp(web_dir))
+        return HTMLResponse(html, headers=NO_CACHE)
 
-    @router.get("/favicon.ico", include_in_schema=False)
+    @router.get("/favicon.ico")
     async def favicon():
         if web_dir is not None:
             icon = web_dir / "favicon.svg"

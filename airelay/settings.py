@@ -159,6 +159,11 @@ def _specs() -> dict[str, SettingSpec]:
             "services.stop_on_shutdown", "services", "网关退出时一并关闭", TYPE_BOOL, False,
             "开启后，网关停止时关闭所有托管的本地服务；关闭则只关那些渠道里单独勾选过的。",
         ),
+        SettingSpec(
+            "services.catalog_ttl_seconds", "services", "上游模型目录缓存(秒)", TYPE_INT, 600,
+            "控制台里「按渠道分组的模型候选」复用上游 /models 结果的时长；点面板上的「刷新上游模型」可随时强制重取。",
+            minimum=60, maximum=86400,
+        ),
         # ---------------- 会话监控 ----------------
         SettingSpec(
             "monitoring.stale_seconds", "monitoring", "僵死判定(秒)", TYPE_INT, 300,

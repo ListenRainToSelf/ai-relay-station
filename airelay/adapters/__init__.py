@@ -3,6 +3,7 @@
 from .base import (
     BaseAdapter,
     ChatRequest,
+    TokenCounter,
     UpstreamCall,
     Usage,
     estimate_messages_tokens,
@@ -17,6 +18,7 @@ from .registry import create_adapter, get_adapter_class, normalize_provider, pro
 __all__ = [
     "BaseAdapter",
     "ChatRequest",
+    "TokenCounter",
     "UpstreamCall",
     "Usage",
     "create_adapter",

@@ -17,6 +17,7 @@ import httpx
 
 from .adapters import (
     ChatRequest,
+    TokenCounter,
     Usage,
     estimate_messages_tokens,
     estimate_tokens,
@@ -290,7 +291,11 @@ class ChatProxy:
                 yield chunk
 
     async def iter_chunks(self, prepared: PreparedCall) -> AsyncIterator[dict[str, Any]]:
-        """流式转发的核心：归一化 chunk + 实时更新会话 + 结束时计量。"""
+        """流式转发的核心：归一化 chunk + 实时更新会话 + 结束时计量。
+
+        已产出文本按「增量累加」统计，不在这里 `"".join(全部文本)` 再估算：
+        那样每来一块都要重扫全文，块数一多就把事件循环占满（详见 TokenCounter）。
+        """
         ctx = self.ctx
         settings = ctx.settings
         usage = prepared.usage
@@ -298,7 +303,7 @@ class ChatProxy:
         status = "ok"
         error_code = ""
         saw_usage = False
-        collected: list[str] = []
+        produced = TokenCounter()
         idle_timeout = settings.get_float("gateway.idle_timeout", 120.0)
         total_budget = settings.get_float("gateway.request_timeout", 600.0)
         include_usage = settings.get_bool("gateway.stream_include_usage", True) or prepared.request.wants_usage()
@@ -322,12 +327,12 @@ class ChatProxy:
                     finish_reason = reason
                 text = _delta_text(chunk)
                 if text:
-                    collected.append(text)
+                    produced.add(text)
                 ctx.live.note_activity(prepared.request_id, chars=len(text), chunks=1)
                 ctx.live.update_usage(
                     prepared.request_id,
                     prompt_tokens=usage.prompt_tokens,
-                    completion_tokens=None if saw_usage else estimate_tokens("".join(collected)),
+                    completion_tokens=None if saw_usage else produced.tokens,
                     source=usage.source,
                 )
                 yield chunk
@@ -340,7 +345,7 @@ class ChatProxy:
             if not saw_usage:
                 usage = Usage(
                     prompt_tokens=usage.prompt_tokens or prepared.prompt_estimate,
-                    completion_tokens=estimate_tokens("".join(collected)),
+                    completion_tokens=produced.tokens,
                     source="estimated",
                 ).finalize()
             if include_usage and not saw_usage:
@@ -393,7 +398,7 @@ class ChatProxy:
             if status == "ok" and not saw_usage:
                 usage = Usage(
                     prompt_tokens=usage.prompt_tokens or prepared.prompt_estimate,
-                    completion_tokens=estimate_tokens("".join(collected)),
+                    completion_tokens=produced.tokens,
                     source="estimated",
                 ).finalize()
             ctx.live.update_usage(

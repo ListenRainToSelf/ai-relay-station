@@ -242,10 +242,24 @@ function toast(kind, title, text, ttl) {
   }, ttl || 4200);
 }
 
-function closeModal() { const root = $('#modal-root'); root.hidden = true; $('#modal-body').replaceChildren(); $('#modal-foot').replaceChildren(); }
+/** 关弹窗时要顺手做完的事（例如把弹窗里攒下的改动一次性落库）。
+ *  关弹窗的入口有好几个（确定/取消/关闭按钮、遮罩、Esc），挂在「关闭」这一步上比
+ *  在每个按钮里各写一遍可靠——漏掉任何一条路，用户都会以为改了、其实没保存。 */
+let modalOnClose = null;
+
+function closeModal() {
+  const root = $('#modal-root');
+  root.hidden = true;
+  $('#modal-body').replaceChildren();
+  $('#modal-foot').replaceChildren();
+  const hook = modalOnClose;
+  modalOnClose = null;
+  if (hook) { try { hook(); } catch (_) { /* 收尾动作失败不该把关闭流程也带崩 */ } }
+}
 function closeDrawer() { const root = $('#drawer-root'); root.hidden = true; $('#drawer-body').replaceChildren(); }
 
 function openModal(title, body, foot) {
+  modalOnClose = null;   // 新弹窗覆盖旧的：上一个没收尾的动作不会赖到这一个头上
   $('#modal-title').textContent = title;
   const bodyHost = $('#modal-body');
   bodyHost.replaceChildren();
@@ -603,9 +617,15 @@ const state = {
   ws: null,
   wsAttempts: 0,
   pollers: [],
+  visibilityHooks: [],
+  statsSignature: '',
+  statsLoading: false,
+  logsSignature: '',
   keyFilter: { search: '', status: '' },
   chanFilter: { search: '', status: '' },
   logFilter: { status: '', model: '' },
+  pulledModels: [],
+  catalog: null,
 };
 
 const VIEWS = [
@@ -698,6 +718,8 @@ function startPoller(fn, intervalMs) {
 function stopPollers() {
   state.pollers.forEach((id) => clearInterval(id));
   state.pollers = [];
+  state.visibilityHooks.forEach((hook) => document.removeEventListener('visibilitychange', hook));
+  state.visibilityHooks = [];
 }
 
 /* ======================================================================== */
@@ -771,14 +793,80 @@ function bucketLabel(bucket) {
 }
 
 /** 统一的取数入口：视图与轮询都走它，保证筛选条件一致。 */
-async function fetchStats() {
+function statsQuery() {
   const query = new URLSearchParams({ hours: String(state.statsWindow), bucket: state.statsBucket });
   if (state.statsFilter.keyId) query.set('key_id', state.statsFilter.keyId);
   if (state.statsFilter.model) query.set('model', state.statsFilter.model);
   if (state.statsFilter.groupBy) query.set('group_by', state.statsFilter.groupBy);
-  const data = await api.get(`${ADMIN}/stats?${query.toString()}`);
+  return query.toString();
+}
+
+/** 首次渲染用：失败要抛出去，让视图显示「加载失败」。 */
+async function fetchStats() {
+  const data = await api.get(`${ADMIN}/stats?${statsQuery()}`);
   state.stats = data;
+  state.statsSignature = statsSignature(data);
   return data;
+}
+
+/* ------------------------------------------------------------------------ */
+/* 统计区块的就地重绘                                                        */
+/*                                                                          */
+/* 之前只有仪表盘那一个轮询，而且它只把数据取回来放进 state，从来没把 KPI 与 */
+/* 折线图重画过——首次渲染之后就冻在那儿了，用量统计页甚至一个轮询都没有。    */
+/* 现在两个视图都把区块挂在 data-role 容器里，按新数据替换容器内容：既不动   */
+/* 筛选器与滚动位置，也不至于每 5 秒重放一次入场动画。                       */
+/* ------------------------------------------------------------------------ */
+const STATS_REFRESH_MS = 5000;
+
+/** 用「会变的几个总量」做指纹：没变化就不重绘，省掉无意义的 DOM 抖动。 */
+function statsSignature(stats) {
+  const overview = (stats && stats.overview) || {};
+  const series = (stats && stats.series) || [];
+  const last = series.length ? series[series.length - 1] : {};
+  return [
+    overview.requests, overview.errors, overview.total_tokens, overview.cost_units,
+    overview.streamed, overview.active_keys, series.length, last.bucket, last.tokens,
+  ].join('|');
+}
+
+/** 就地替换容器内容。
+
+ * 刷新时要去掉 `anim`：那是入场动画（0.42s 上浮淡入），首次渲染用来看得舒服，
+ * 但每 5 秒重放一次就是整片网格反复闪动。 */
+function repaint(selector, nodes) {
+  const target = $(selector);
+  if (!target) return;
+  nodes.forEach((node) => node.classList && node.classList.remove('anim'));
+  target.replaceChildren(...nodes);
+}
+
+/** 轮询用的刷新：数据没变就不回调重绘；失败保留上一次画面。 */
+async function refreshStats(onChanged) {
+  if (state.statsLoading) return;   // 慢请求不叠加，避免旧结果盖掉新结果
+  state.statsLoading = true;
+  try {
+    const data = await api.get(`${ADMIN}/stats?${statsQuery()}`);
+    const signature = statsSignature(data);
+    const changed = signature !== state.statsSignature;
+    state.stats = data;
+    state.statsSignature = signature;
+    if (changed) onChanged();
+  } catch (_) {
+    // 网络抖一下不该把已经画好的界面清空，下一次 tick 会再试
+  } finally {
+    state.statsLoading = false;
+  }
+}
+
+/** 统计类视图的定时刷新：首帧是渲染时取的，所以这里等一个间隔再取第二帧；
+ *  标签页在后台时不发请求，切回前台立刻补一次，回来看到的就是最新的。 */
+function startStatsPoller(onChanged) {
+  const tick = () => { if (!document.hidden) refreshStats(onChanged); };
+  state.pollers.push(setInterval(tick, STATS_REFRESH_MS));
+  const onVisible = () => { if (!document.hidden) refreshStats(onChanged); };
+  document.addEventListener('visibilitychange', onVisible);
+  state.visibilityHooks.push(onVisible);
 }
 
 function statsFilterBar(onChange) {
@@ -998,12 +1086,6 @@ function meter(percent, label, options) {
     el('div', { class: 'meter__track' }, el('div', { class: 'meter__fill ' + (tone ? 'meter__fill--' + tone : ''), style: { width: Math.min(100, value) + '%' } })));
 }
 
-/** 一个 checkbox + 文字的开关行（用于渠道表单里的托管选项）。 */
-function lifeToggle(toggleNode, text) {
-  return el('label', { class: 'toggle' },
-    toggleNode.querySelector('input'), el('span', { class: 'toggle__track' }), el('span', { text }));
-}
-
 function field(label, control, hint) {
   // 原生控件用 <label> 换取点击聚焦；自定义控件（标签输入、开关）用 <div> 避免嵌套
   const native = control && ['INPUT', 'SELECT', 'TEXTAREA'].includes(control.tagName);
@@ -1029,15 +1111,25 @@ function selectInput(options, value, attrs) {
   });
   return node;
 }
-function toggleInput(checked) {
+function toggleInput(checked, text) {
   const input = el('input', { type: 'checkbox' });
   input.checked = !!checked;
-  return el('label', { class: 'toggle' }, input, el('span', { class: 'toggle__track' }), el('span', { text: '启用' }));
+  return el('label', { class: 'toggle' }, input, el('span', { class: 'toggle__track' }), el('span', { text: text || '启用' }));
 }
-function tagInput(values) {
+
+/** 读开关状态。
+ * 只认「节点里现在有没有勾上的 input」，不缓存节点里的 input 引用——
+ * 否则一旦开关被挪进别的容器，读到的就是 null，而报错只出现在控制台里，
+ * 界面上表现为「点了没反应」。 */
+function toggleValue(node) {
+  const input = node && node.querySelector('input');
+  return !!(input && input.checked);
+}
+function tagInput(values, attrs) {
   const tags = Array.isArray(values) ? values.slice() : [];
   const wrapper = el('div', { class: 'taginput' });
-  const input = el('input', { type: 'text', placeholder: '输入后回车，如 claude-* 或 fast', spellcheck: 'false' });
+  const input = el('input', Object.assign(
+    { type: 'text', placeholder: '输入后回车，如 claude-* 或 fast', spellcheck: 'false' }, attrs || {}));
   const render = () => {
     wrapper.replaceChildren(...tags.map((tag, index) => el('span', { class: 'chip chip--mono' }, tag,
       el('button', { class: 'iconbtn', style: { width: '16px', height: '16px', fontSize: '10px' }, text: '✕', type: 'button', onclick: () => { tags.splice(index, 1); render(); } }))), input);
@@ -1057,6 +1149,294 @@ function tagInput(values) {
   render();
   wrapper.getValues = () => tags.slice();
   return wrapper;
+}
+
+/* --------------------------------------------------------------------------- *
+ * 模型候选池：凡是要填模型名的地方都从这里下拉，不再靠手打
+ *
+ * 模型 id 最容易拼错（glm-4.7-flash 与 glm-4-flash 差一个点就废一条白名单，
+ * 计价表的键错一个字母单价就悄悄不生效），而候选本来就是现成的：别名、别名指向的
+ * 上游 id、各渠道白名单、窗口内用过的模型、以及刚从上拉取到的列表。
+ * --------------------------------------------------------------------------- */
+const MODEL_LIST_ID = 'model-candidates';
+const ALIAS_LIST_ID = 'alias-candidates';
+
+function modelCandidates(extra) {
+  const names = new Set();
+  const add = (value) => { if (value) names.add(String(value)); };
+  (state.maps || []).forEach((item) => { add(item.alias); add(item.upstream_model); });
+  (state.channels || []).forEach((channel) => (channel.models || []).forEach(add));
+  const available = (state.stats && state.stats.available) || {};
+  (available.models || []).forEach(add);
+  ((state.catalog && state.catalog.models) || []).forEach(add);
+  (state.pulledModels || []).forEach(add);
+  (extra || []).forEach(add);
+  return Array.from(names).sort((a, b) => a.localeCompare(b));
+}
+
+/** 拉一次模型目录（按渠道分组），并刷新 datalist 用的候选。
+ * refresh=true 才会去问上游（慢、可能被限流），所以只在用户显式点「刷新上游模型」时用。 */
+async function loadCatalog(refresh) {
+  try {
+    const data = await api.get(`${ADMIN}/models/catalog${refresh ? '?refresh=true' : ''}`);
+    state.catalog = data;
+    refreshModelDatalist();
+    return data;
+  } catch (error) {
+    if (refresh) toast('err', '拉取上游模型失败', error.message);
+    return state.catalog;
+  }
+}
+
+/** 分组候选：按渠道分组（渠道白名单 + 上游真实 id），再加别名与最近用过的模型。
+ * 分组是为了回答「这个模型名是哪家的」——填白名单时最需要知道的就是这件事。 */
+function modelGroups(extra) {
+  const groups = [];
+  const seen = new Set();
+  const push = (title, hint, names) => {
+    const items = [];
+    (names || []).forEach((name) => {
+      const key = String(name || '').trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      items.push(key);
+    });
+    if (items.length) groups.push({ title, hint: hint || '', items });
+  };
+  const catalog = state.catalog;
+  if (catalog && Array.isArray(catalog.channels)) {
+    catalog.channels.forEach((entry) => {
+      let hint = '渠道白名单';
+      if (entry.upstream_error) hint = '上游列表没拉到：' + entry.upstream_error;
+      else if ((entry.upstream_ids || []).length) hint = `上游可用 ${entry.upstream_ids.length} 个`;
+      if (entry.status !== 'active') hint += ' · 已禁用';
+      push(entry.name, hint, (entry.models || []).concat(entry.upstream_ids || []));
+    });
+    push('模型别名', '客户端可以直接用这些名字', (catalog.aliases || []).map((item) => item.alias));
+    push('别名指向的上游模型', '', (catalog.aliases || []).map((item) => item.upstream_model));
+  } else {
+    (state.channels || []).forEach((channel) => push(channel.name, '渠道白名单', channel.models));
+  }
+  push('最近用过的模型', '', ((state.stats && state.stats.available && state.stats.available.models) || []));
+  push('本次拉取到的', '', state.pulledModels || []);
+  push('本次已填', '', extra || []);
+  return groups;
+}
+
+/** 把候选写成 <datalist>，返回它的 id（供 input 的 list 属性引用）。
+ *
+ * 用原生 datalist 而不是自绘弹层：键盘上下选、回车确认、以及「继续手输通配符」
+ * 都由浏览器负责，少一个自定义控件就少一类「点了没反应」的坑。 */
+function ensureDatalist(id, values) {
+  let node = document.getElementById(id);
+  if (!node) { node = el('datalist', { id }); document.body.appendChild(node); }
+  node.replaceChildren(...values.map((value) => el('option', { value: String(value) })));
+  return id;
+}
+
+/** 刷新模型候选并返回 datalist 的 id。每次开表单时调用，候选跟着最新数据走。 */
+function refreshModelDatalist(extra) {
+  return ensureDatalist(MODEL_LIST_ID, modelCandidates(extra));
+}
+
+function refreshAliasDatalist() {
+  return ensureDatalist(ALIAS_LIST_ID, (state.maps || []).map((item) => item.alias).filter(Boolean));
+}
+
+/** 带模型候选的文本框：用于「上游真实模型」「路由试算」这类单个模型名输入。 */
+function modelInput(value, attrs) {
+  return textInput(value, Object.assign({ class: 'mono', list: refreshModelDatalist() }, attrs || {}));
+}
+
+/** 模型多选器：标签 + 按渠道分组的候选面板。
+ *
+ * 白名单/允许模型这类地方要「看得到全部模型、一眼知道它是哪家的」，原生 datalist
+ * 只能给一列扁平的名字，所以这里自绘面板，但把危险动作都交给浏览器管着：
+ * 候选用 mousedown+preventDefault 加进去（不夺走焦点，也就不会触发输入框的失焦提交），
+ * 回车仍然提交「输入框里原样的文本」——通配符（claude-*）就是靠这条活着的。
+ */
+function modelPicker(values, options) {
+  const opts = options || {};
+  const tags = Array.isArray(values) ? values.slice() : [];
+  // 外层容器放「标签行 + 候选面板」：标签行每次重绘都会 replaceChildren，
+  // 面板若挂在同一个节点里会被一并清掉（下拉加一次就消失），所以必须分两层。
+  const root = el('div', { class: 'pickwrap' });
+  const wrapper = el('div', { class: 'taginput' });
+  const input = el('input', {
+    type: 'text', spellcheck: 'false',
+    placeholder: opts.placeholder || '输入或从下拉里选；支持通配，如 claude-*',
+  });
+  const panel = el('div', { class: 'modelpick', hidden: true });
+  let flat = [];    // 当前可点的候选名（顺序与面板上的按钮一致，键盘导航用下标而不是节点）
+  let hot = -1;     // 键盘高亮的下标
+
+  const has = (name) => tags.includes(name);
+  const addTag = (name) => {
+    const value = String(name || '').trim();
+    if (!value || has(value)) { input.value = ''; return; }
+    tags.push(value);
+    input.value = '';
+    if (opts.onAdd) opts.onAdd(value);
+    paint();
+    renderChips();
+  };
+  const removeTag = (index) => { tags.splice(index, 1); paint(); renderChips(); };
+  const commit = () => {
+    if (input.value.trim()) addTag(input.value);
+    else if (hot >= 0 && flat[hot]) addTag(flat[hot]);
+  };
+
+  const renderChips = () => {
+    wrapper.replaceChildren(...tags.map((tag, index) => el('span', { class: 'chip chip--mono' }, tag,
+      el('button', {
+        class: 'iconbtn', style: { width: '16px', height: '16px', fontSize: '10px' }, text: '✕', type: 'button',
+        onclick: () => removeTag(index),
+      }))), input);
+  };
+
+  const match = (name) => {
+    const needle = input.value.trim().toLowerCase();
+    return !needle || name.toLowerCase().includes(needle);
+  };
+
+  const paint = () => {
+    const catalog = state.catalog;
+    const groups = modelGroups(opts.extra || []).map((group) => Object.assign({}, group, {
+      items: group.items.filter(match),
+    })).filter((group) => group.items.length);
+    flat = [];
+    hot = -1;
+    const blocks = groups.map((group) => el('div', { class: 'modelpick__group' },
+      el('div', { class: 'modelpick__title' },
+        el('span', { text: group.title }),
+        group.hint ? el('span', { class: 'micro', text: group.hint }) : null),
+      el('div', { class: 'modelpick__grid' }, group.items.slice(0, 80).map((name) => {
+        flat.push(name);
+        return el('button', {
+          class: 'chip chip--mono' + (has(name) ? ' chip--off' : ''),
+          type: 'button',
+          dataset: { name },
+          onmousedown: (event) => { event.preventDefault(); addTag(name); },
+        }, has(name) ? name + ' ✓' : name);
+      }))));
+    const footer = el('div', { class: 'modelpick__foot' },
+      el('span', {
+        class: 'micro',
+        text: catalog && catalog.channels ? '候选按渠道分组；↑↓ 选、回车加，也可以直接手输通配符'
+          : '还没取到模型目录，点右边刷新',
+      }),
+      el('div', { class: 'spacer' }),
+      el('button', {
+        class: 'btn btn--tiny', type: 'button', text: '刷新上游模型',
+        onclick: async (event) => {
+          event.stopPropagation();
+          const button = event.currentTarget;
+          button.disabled = true;
+          button.textContent = '正在拉取…';
+          await loadCatalog(true);
+          button.disabled = false;
+          button.textContent = '刷新上游模型';
+          paint();
+          toast('info', '上游模型已刷新', '候选里现在能看到各渠道上游返回的模型 id', 4000);
+        },
+      }));
+    panel.replaceChildren(...(blocks.length ? blocks : [el('p', { class: 'panel__hint', text: '没有匹配的候选，回车可直接把输入的内容加进去' })]), footer);
+  };
+
+  const open = () => { paint(); panel.hidden = false; };
+  const close = () => { panel.hidden = true; hot = -1; };
+
+  input.addEventListener('focus', () => {
+    open();
+    // 首次聚焦时顺手取一次目录（走缓存，几乎不花时间），让面板立刻有分组内容
+    if (!state.catalog) loadCatalog(false).then(open);
+  });
+  input.addEventListener('input', () => { if (panel.hidden) panel.hidden = false; paint(); });
+  input.addEventListener('blur', () => {
+    // 失焦时把输入内容收成标签（老行为），并关掉面板
+    if (input.value.trim()) commit();
+    close();
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ',') { event.preventDefault(); commit(); paint(); }
+    else if (event.key === 'Backspace' && !input.value && tags.length) { removeTag(tags.length - 1); }
+    else if (event.key === 'Escape') { close(); }
+    else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      if (!flat.length) return;
+      event.preventDefault();
+      hot = event.key === 'ArrowDown'
+        ? (hot + 1 >= flat.length ? 0 : hot + 1)
+        : (hot <= 0 ? flat.length - 1 : hot - 1);
+      [...panel.querySelectorAll('.chip')].forEach((node, i) => { node.dataset.hot = String(i === hot); });
+      const node = panel.querySelectorAll('.chip')[hot];
+      if (node && node.scrollIntoView) node.scrollIntoView({ block: 'nearest' });
+    }
+  });
+  wrapper.addEventListener('mousedown', (event) => {
+    // 点空白处不要触发失焦提交，聚焦输入框即可
+    if (event.target === wrapper) { event.preventDefault(); input.focus(); }
+  });
+
+  renderChips();
+  root.append(wrapper, panel);
+  root.getValues = () => tags.slice();
+  root.setValues = (next) => { tags.length = 0; (next || []).forEach((name) => tags.push(name)); paint(); renderChips(); };
+  root.add = (name) => addTag(name);
+  return root;
+}
+
+/** 上游模型列表弹窗：adopt(id) 决定「加入」落到哪里（已保存渠道走存盘，未保存的表单加进标签）。
+ *  onClose 在弹窗关闭时执行一次，给「攒着改动、关窗时统一落库」的调用方用。 */
+function showModelsModal(title, items, adopt, onClose) {
+  const addAll = () => {
+    items.forEach((item) => adopt(item.id));
+    closeModal();
+  };
+  openModal(title,
+    el('div', { class: 'stack' },
+      el('p', { class: 'panel__hint', text: '点模型名加入，或一键全加。这些 id 也会进下拉候选。' }),
+      el('div', { class: 'row', style: { flexWrap: 'wrap', gap: '6px' } }, items.map((item) => el('button', {
+        class: 'chip chip--mono', style: { cursor: 'pointer' },
+        onclick: () => adopt(item.id),
+      }, item.id, el('span', { class: 'panel__hint', text: item.owned_by ? ' · ' + item.owned_by : '' })))),
+      el('div', { class: 'codetext', text: items.map((item) => item.id).join('\n') })),
+    [el('button', { class: 'btn btn--primary', text: '全部加入', onclick: addAll }),
+     el('button', { class: 'btn', text: '关闭', onclick: () => closeModal() })]);
+  modalOnClose = onClose || null;   // 必须在 openModal 之后设：openModal 会清掉上一个收尾动作
+}
+
+/** 计价表：把原生 JSON 文本框配上一排「已知模型」快捷按钮。
+ *
+ * 计价表的键就是模型名，手打错一个字母单价就悄悄不生效（报表显示 0 元却没人报错）。
+ * 这里只做「插入一条空条目」，不解析也不重写已有内容——媒体类价目用的是
+ * character / second / image 这些单位，用行编辑器去回写会把它们弄丢。
+ */
+function pricingEditor(textarea) {
+  const insert = (name) => {
+    let data;
+    try {
+      data = JSON.parse(textarea.value || '{}');
+    } catch (_) {
+      toast('warn', 'JSON 还没写对', '先改成合法 JSON（或清空）再加条目');
+      textarea.focus();
+      return;
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) data = {};
+    if (data[name]) { toast('info', '已经有这一条了', name); return; }
+    data[name] = { prompt: 0, completion: 0 };
+    textarea.value = JSON.stringify(data, null, 2);
+    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+    toast('ok', '已加入计价表', name + '：把单价填上再保存');
+  };
+  const names = modelCandidates();
+  if (!names.length) return textarea;
+  return el('div', { class: 'stack' },
+    el('div', { class: 'row', style: { flexWrap: 'wrap', gap: '6px' } },
+      el('span', { class: 'micro', text: '快捷添加：' }),
+      names.slice(0, 30).map((name) => el('button', {
+        class: 'chip chip--mono', style: { cursor: 'pointer' }, onclick: () => insert(name),
+      }, name))),
+    textarea);
 }
 
 function emptyState(title, hint, action) {
@@ -1117,7 +1497,6 @@ async function viewDashboard(host, token) {
   state.health = health;
   state.providers = (state.system && state.system.providers) || state.providers;
 
-  const overview = stats.overview || {};
   const container = el('div', { class: 'stack' });
 
   container.appendChild(el('div', { class: 'view__head' },
@@ -1130,47 +1509,9 @@ async function viewDashboard(host, token) {
 
   container.appendChild(statsFilterBar(() => navigate('dashboard')));
 
-  const kpis = el('div', { class: 'grid grid--kpi' },
-    kpiCard({ key: '请求数', value: fmt.int(overview.requests), foot: el('span', { text: `${overview.streamed || 0} 次流式` }), index: 0 }),
-    kpiCard({ key: '成功率', value: fmt.pct(100 - (overview.error_rate || 0)), unit: '', foot: el('span', { text: `失败 ${overview.errors || 0} 次` }), accent: 'var(--emerald)', index: 1 }),
-    kpiCard({ key: 'Token 总量', value: fmt.int(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.int(overview.prompt_tokens)} / 输出 ${fmt.int(overview.completion_tokens)}` }), index: 2 }),
-    kpiCard({ key: '平均首字延迟', value: fmt.ms(overview.avg_first_token_ms), foot: el('span', { text: `平均总耗时 ${fmt.ms(overview.avg_latency_ms)}` }), accent: 'var(--violet)', index: 3 }),
-    kpiCard({ key: '平均输出速度', value: overview.avg_speed_tok_s ? overview.avg_speed_tok_s.toFixed(1) : '—', unit: 'tok/s', foot: el('span', { text: '按流式请求统计' }), accent: 'var(--amber)', index: 4 }),
-    kpiCard({ key: '预估费用', value: fmt.moneyLabel(stats.pricing && stats.pricing.currency) + fmt.money(overview.cost_units), foot: el('span', { text: `${fmt.int(overview.cost_units)} µ$ · 按已配置单价` }), accent: 'var(--rose)', index: 5 }));
-  container.appendChild(kpis);
-
-  const throughput = panel('吞吐趋势', tokenChartBlock(stats, {
-    empty: emptyState('这个时间窗口还没有请求', '在「密钥」页创建一个本地密钥，然后用任意 OpenAI 客户端发一次请求试试。',
-      el('button', { class: 'btn btn--primary', onclick: () => navigate('keys') }, '去创建密钥')),
-  }),
-    {
-      actions: el('span', {
-        class: 'panel__hint',
-        text: (state.statsFilter.groupBy === 'model' ? '按模型对比 · ' : '')
-          + (state.statsBucket === 'hour' ? '按小时聚合' : '按天聚合'),
-      }),
-    });
-  container.appendChild(throughput);
-
-  const middle = el('div', { class: 'grid grid--3' });
-  middle.appendChild(panel('模型分布', (stats.by_model || []).length
-    ? barList(stats.by_model.map((row) => ({ name: row.model, value: row.requests, label: fmt.int(row.requests) + ' 次 · ' + fmt.int(row.tokens) + ' tok' })))
-    : el('p', { class: 'panel__hint', text: '暂无数据' }), { index: 1 }));
-
-  middle.appendChild(panel('渠道分布', (stats.by_channel || []).length
-    ? el('div', { class: 'stack' }, barList(stats.by_channel.map((row) => ({ name: row.channel_name || '（已删除）', value: row.requests, label: fmt.int(row.requests) + ' 次' }))),
-      el('div', { class: 'legend' }, stats.by_channel.slice(0, 4).map((row) => el('span', null,
-        el('i', { style: { background: 'var(--line-2)' } }),
-        `${row.channel_name || '—'} · ${fmt.speed(row.avg_speed_tok_s)}`))))
-    : el('p', { class: 'panel__hint', text: '暂无数据' }), { index: 2 }));
-
-  middle.appendChild(panel('成功 / 失败', el('div', { class: 'donut' },
-    donut((overview.requests || 0) - (overview.errors || 0), overview.errors || 0),
-    el('div', { class: 'donut__meta' },
-      el('div', null, el('div', { class: 'kpi__key', text: '成功' }), el('div', { class: 'mono', style: { fontSize: '16px' }, text: fmt.int((overview.requests || 0) - (overview.errors || 0)) })),
-      el('div', null, el('div', { class: 'kpi__key', text: '失败' }), el('div', { class: 'mono', style: { fontSize: '16px', color: 'var(--rose)' }, text: fmt.int(overview.errors || 0) })),
-      el('div', { class: 'panel__hint', text: `流式 ${overview.streamed || 0} 次` }))), { index: 3 }));
-  container.appendChild(middle);
+  container.appendChild(el('div', { class: 'grid grid--kpi', 'data-role': 'dash-kpis' }, dashboardKpis(stats)));
+  container.appendChild(el('div', { 'data-role': 'dash-charts' }, dashboardCharts(stats)));
+  container.appendChild(el('div', { class: 'grid grid--3', 'data-role': 'dash-middle' }, dashboardMiddle(stats)));
 
   const livePanel = el('div', { class: 'panel panel--live anim', 'data-role': 'dash-live', style: { '--i': 4 } });
   container.appendChild(livePanel);
@@ -1191,10 +1532,66 @@ async function viewDashboard(host, token) {
   container.appendChild(opsPanel);
 
   host.replaceChildren(container);
-  startPoller(async () => {
-    await fetchStats();
+  startStatsPoller(() => {
+    paintDashboardStats();
     paintSignal();
-  }, 15000);
+  });
+}
+
+function dashboardKpis(stats) {
+  const overview = (stats && stats.overview) || {};
+  return [
+    kpiCard({ key: '请求数', value: fmt.int(overview.requests), foot: el('span', { text: `${overview.streamed || 0} 次流式` }), index: 0 }),
+    kpiCard({ key: '成功率', value: fmt.pct(100 - (overview.error_rate || 0)), unit: '', foot: el('span', { text: `失败 ${overview.errors || 0} 次` }), accent: 'var(--emerald)', index: 1 }),
+    kpiCard({ key: 'Token 总量', value: fmt.int(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.int(overview.prompt_tokens)} / 输出 ${fmt.int(overview.completion_tokens)}` }), index: 2 }),
+    kpiCard({ key: '平均首字延迟', value: fmt.ms(overview.avg_first_token_ms), foot: el('span', { text: `平均总耗时 ${fmt.ms(overview.avg_latency_ms)}` }), accent: 'var(--violet)', index: 3 }),
+    kpiCard({ key: '平均输出速度', value: overview.avg_speed_tok_s ? overview.avg_speed_tok_s.toFixed(1) : '—', unit: 'tok/s', foot: el('span', { text: '按流式请求统计' }), accent: 'var(--amber)', index: 4 }),
+    kpiCard({ key: '预估费用', value: fmt.moneyLabel(stats && stats.pricing && stats.pricing.currency) + fmt.money(overview.cost_units), foot: el('span', { text: `${fmt.int(overview.cost_units)} µ$ · 按已配置单价` }), accent: 'var(--rose)', index: 5 }),
+  ];
+}
+
+function dashboardCharts(stats) {
+  return [
+    panel('吞吐趋势', tokenChartBlock(stats, {
+      empty: emptyState('这个时间窗口还没有请求', '在「密钥」页创建一个本地密钥，然后用任意 OpenAI 客户端发一次请求试试。',
+        el('button', { class: 'btn btn--primary', onclick: () => navigate('keys') }, '去创建密钥')),
+    }),
+      {
+        actions: el('span', {
+          class: 'panel__hint',
+          text: (state.statsFilter.groupBy === 'model' ? '按模型对比 · ' : '')
+            + (state.statsBucket === 'hour' ? '按小时聚合' : '按天聚合'),
+        }),
+      }),
+  ];
+}
+
+function dashboardMiddle(stats) {
+  const overview = (stats && stats.overview) || {};
+  return [
+    panel('模型分布', (stats.by_model || []).length
+      ? barList(stats.by_model.map((row) => ({ name: row.model, value: row.requests, label: fmt.int(row.requests) + ' 次 · ' + fmt.int(row.tokens) + ' tok' })))
+      : el('p', { class: 'panel__hint', text: '暂无数据' }), { index: 1 }),
+    panel('渠道分布', (stats.by_channel || []).length
+      ? el('div', { class: 'stack' }, barList(stats.by_channel.map((row) => ({ name: row.channel_name || '（已删除）', value: row.requests, label: fmt.int(row.requests) + ' 次' }))),
+        el('div', { class: 'legend' }, stats.by_channel.slice(0, 4).map((row) => el('span', null,
+          el('i', { style: { background: 'var(--line-2)' } }),
+          `${row.channel_name || '—'} · ${fmt.speed(row.avg_speed_tok_s)}`))))
+      : el('p', { class: 'panel__hint', text: '暂无数据' }), { index: 2 }),
+    panel('成功 / 失败', el('div', { class: 'donut' },
+      donut((overview.requests || 0) - (overview.errors || 0), overview.errors || 0),
+      el('div', { class: 'donut__meta' },
+        el('div', null, el('div', { class: 'kpi__key', text: '成功' }), el('div', { class: 'mono', style: { fontSize: '16px' }, text: fmt.int((overview.requests || 0) - (overview.errors || 0)) })),
+        el('div', null, el('div', { class: 'kpi__key', text: '失败' }), el('div', { class: 'mono', style: { fontSize: '16px', color: 'var(--rose)' }, text: fmt.int(overview.errors || 0) })),
+        el('div', { class: 'panel__hint', text: `流式 ${overview.streamed || 0} 次` }))), { index: 3 }),
+  ];
+}
+
+function paintDashboardStats() {
+  const stats = state.stats || {};
+  repaint('[data-role="dash-kpis"]', dashboardKpis(stats));
+  repaint('[data-role="dash-charts"]', dashboardCharts(stats));
+  repaint('[data-role="dash-middle"]', dashboardMiddle(stats));
 }
 
 function paintDashboardLive(existing) {
@@ -1290,6 +1687,35 @@ function paintLiveView() {
 
 /* ======================================================================== */
 /* 十、视图：渠道                                                            */
+/** 渠道是不是「现在还是坏的」。
+ *
+ * `last_error` 是留给排障的「最近一次错误」，成功后并不擦掉（擦了下一次就查不到线索），
+ * 所以光看它非空，会把早已恢复的渠道一直标成失败——例如上游一时忙、或用户发了一张
+ * 上游不认的图片，那条错误就会永远挂在列表上。判定要看时间先后：只有错误比最近一次
+ * 成功更新（或压根没有成功过）才算真的在失败。
+ */
+function channelFailing(channel) {
+  if (!channel.last_error) return false;
+  if (channel.consecutive_failures) return true;
+  const failed = Date.parse(channel.last_error_at || '');
+  const succeeded = Date.parse(channel.last_ok_at || '');
+  if (!Number.isFinite(succeeded)) return true;
+  if (!Number.isFinite(failed)) return true;
+  return failed > succeeded;
+}
+
+/** 健康徽记的悬停说明：把「最近一次错误」原文和时间露出来。
+ *  列表里只有一个小徽记，错误内容不落到界面上的话，用户只能看到「失败」两个字却无从下手。 */
+function channelErrorHint(channel) {
+  const lines = [];
+  if (channel.last_error) {
+    lines.push('最近错误：' + channel.last_error);
+    if (channel.last_error_at) lines.push('发生时间：' + fmt.dt(channel.last_error_at) + '（' + fmt.rel(channel.last_error_at) + '）');
+  }
+  if (channel.last_ok_at) lines.push('最近成功：' + fmt.dt(channel.last_ok_at) + '（' + fmt.rel(channel.last_ok_at) + '）');
+  return lines.join('\n') || '暂无记录';
+}
+
 /* ======================================================================== */
 
 async function viewChannels(host, token) {
@@ -1376,9 +1802,10 @@ function channelRow(channel, balance) {
     el('td', null, el('span', { class: 'mono', text: `P${channel.priority} · W${channel.weight}` })),
     el('td', null, health.cooling
       ? chip('冷却 ' + Math.round(health.cooldown_remaining || 0) + 's', 'warn')
-      : (channel.last_error
-        ? chip('失败 ×' + (channel.consecutive_failures || 1), 'err')
-        : chip('正常', 'ok'))),
+      : (channelFailing(channel)
+        ? el('span', { title: channelErrorHint(channel) }, chip('失败 ×' + (channel.consecutive_failures || 1), 'err'))
+        : el('span', { title: channel.last_error ? channelErrorHint(channel) : '最近没有失败记录' },
+          chip('正常', 'ok')))),
     el('td', null, balance
       ? (balance.supported
         ? (balance.fetched_at
@@ -1389,6 +1816,7 @@ function channelRow(channel, balance) {
     el('td', null, channel.status === 'active' ? chip('启用', 'ok') : chip('禁用', 'off')),
     el('td', { class: 'actions' },
       el('button', { class: 'btn btn--tiny', onclick: () => probeChannel(channel) }, '探针'),
+      el('button', { class: 'btn btn--tiny', onclick: () => fetchChannelModels(channel), title: '拉取上游模型列表，按真实 id 补全白名单' }, '白名单'),
       el('button', { class: 'btn btn--tiny', onclick: () => channelForm(channel) }, '编辑'),
       health.cooling ? el('button', { class: 'btn btn--tiny', onclick: () => resetCooldown(channel) }, '解除冷却') : null,
       el('button', { class: 'btn btn--tiny', onclick: () => toggleChannel(channel) }, channel.status === 'active' ? '禁用' : '启用'),
@@ -1409,7 +1837,7 @@ function channelForm(channel) {
     api_key: el('input', { type: 'password', placeholder: editing ? '留空表示不修改' : 'sk-...', class: 'mono' }),
     priority: numberInput(channel ? channel.priority : 0, { min: 0, step: 1 }),
     weight: numberInput(channel ? channel.weight : 1, { min: 0, step: 1 }),
-    models: tagInput(channel ? channel.models : []),
+    models: modelPicker(channel ? channel.models : [], { extra: channel ? channel.models : [] }),
     balance_url: textInput(channel ? channel.balance_url : '', { placeholder: '留空则用厂商内置适配器', class: 'mono' }),
     balance_json_path: textInput(channel ? channel.balance_json_path : '', { placeholder: '如 data.balance', class: 'mono' }),
     balance_currency: textInput(channel ? channel.balance_currency : '', { placeholder: '如 CNY', class: 'mono' }),
@@ -1428,7 +1856,7 @@ function channelForm(channel) {
     check_interval_seconds: 15, failure_threshold: 3, max_restarts: 0, restart_backoff_seconds: 30,
   }, (channel && channel.lifecycle) || {});
   const lifeInputs = {
-    enabled: toggleInput(!!life.enabled),
+    enabled: toggleInput(!!life.enabled, '启用托管'),
     command: textInput(life.command, { placeholder: 'D:\my-llm\start.bat', class: 'mono' }),
     args: textInput(Array.isArray(life.args) ? life.args.join(' ') : life.args, { placeholder: '可选，空格分隔', class: 'mono' }),
     workdir: textInput(life.workdir, { placeholder: '默认取脚本所在目录', class: 'mono' }),
@@ -1445,9 +1873,9 @@ function channelForm(channel) {
     failure_threshold: numberInput(life.failure_threshold, { min: 1, max: 60, step: 1 }),
     max_restarts: numberInput(life.max_restarts, { min: 0, max: 1000, step: 1 }),
     restart_backoff_seconds: numberInput(life.restart_backoff_seconds, { min: 5, max: 3600, step: 5 }),
-    auto_start: toggleInput(!!life.auto_start),
-    auto_restart: toggleInput(!!life.auto_restart),
-    stop_on_shutdown: toggleInput(!!life.stop_on_shutdown),
+    auto_start: toggleInput(!!life.auto_start, '网关启动时自动拉起'),
+    auto_restart: toggleInput(!!life.auto_restart, '掉线自动重启'),
+    stop_on_shutdown: toggleInput(!!life.stop_on_shutdown, '网关退出时一并关闭'),
   };
   // ---- 能力（可选，只能比协议支持的更窄）----
   const capabilityHost = el('div', { class: 'row', style: { gap: '14px' } });
@@ -1511,11 +1939,11 @@ function channelForm(channel) {
         field('失败几次才重启', lifeInputs.failure_threshold, '避免一次抖动就重启'),
         field('重启上限', lifeInputs.max_restarts, '0 = 不限；达到上限后停止自动重启并标记异常'),
         field('重启退避(秒)', lifeInputs.restart_backoff_seconds, '按重启次数线性放大，最多 10 倍')),
-      el('div', { class: 'row' },
-        lifeToggle(lifeInputs.enabled, '启用托管'),
-        lifeToggle(lifeInputs.auto_start, '网关启动时自动拉起'),
-        lifeToggle(lifeInputs.auto_restart, '掉线自动重启'),
-        lifeToggle(lifeInputs.stop_on_shutdown, '网关退出时一并关闭'))));
+      el('div', { class: 'row', style: { gap: '18px', flexWrap: 'wrap' } },
+        lifeInputs.enabled,
+        lifeInputs.auto_start,
+        lifeInputs.auto_restart,
+        lifeInputs.stop_on_shutdown)));
 
   renderCapabilities(inputs.provider_type.value);
   inputs.provider_type.addEventListener('change', () => {
@@ -1531,7 +1959,7 @@ function channelForm(channel) {
       field('协议', inputs.provider_type, '决定用哪套适配器翻译请求'),
       el('div', { class: 'span-2' }, field('上游 base_url', inputs.base_url, '填厂商给的端点根地址；OpenAI 兼容类必填')),
       el('div', { class: 'span-2' }, field(editing ? '上游 API Key（留空不修改）' : '上游 API Key', inputs.api_key)),
-      el('div', { class: 'span-2' }, field('模型白名单', inputs.models, '留空表示该渠道服务所有模型；支持通配，如 claude-*、deepseek-*')),
+      el('div', { class: 'span-2' }, field('模型白名单', inputs.models, '留空表示该渠道服务所有模型。下拉里按渠道列出已知模型与上游真实 id，也支持手输通配，如 claude-*、deepseek-*')),
       field('优先级', inputs.priority, '数字越小越优先，0 最高'),
       field('权重', inputs.weight, '同优先级内按权重加权随机'),
       field('状态', inputs.status),
@@ -1584,7 +2012,7 @@ function channelForm(channel) {
     const picked = supported.filter((cap) => capabilityState.has(cap));
     payload.capabilities = (picked.length && picked.length < supported.length) ? picked : [];
     payload.lifecycle = {
-      enabled: lifeInputs.enabled.querySelector('input').checked,
+      enabled: toggleValue(lifeInputs.enabled),
       command: lifeInputs.command.value.trim(),
       args: lifeInputs.args.value.trim(),
       workdir: lifeInputs.workdir.value.trim(),
@@ -1596,9 +2024,9 @@ function channelForm(channel) {
       failure_threshold: Number(lifeInputs.failure_threshold.value || 3),
       max_restarts: Number(lifeInputs.max_restarts.value || 0),
       restart_backoff_seconds: Number(lifeInputs.restart_backoff_seconds.value || 30),
-      auto_start: lifeInputs.auto_start.querySelector('input').checked,
-      auto_restart: lifeInputs.auto_restart.querySelector('input').checked,
-      stop_on_shutdown: lifeInputs.stop_on_shutdown.querySelector('input').checked,
+      auto_start: toggleValue(lifeInputs.auto_start),
+      auto_restart: toggleValue(lifeInputs.auto_restart),
+      stop_on_shutdown: toggleValue(lifeInputs.stop_on_shutdown),
     };
     if (payload.lifecycle.enabled && !payload.lifecycle.command) {
       errorLine.textContent = '启用本地进程托管时必须填写启动命令';
@@ -1619,6 +2047,10 @@ function channelForm(channel) {
       else await api.post(`${ADMIN}/channels`, payload);
       closeDrawer();
       toast('ok', editing ? '渠道已更新' : '渠道已创建', payload.name);
+      if (!editing && !payload.models.length) {
+        // 白名单留空 = 这个渠道服务所有模型；想收窄可以在表单里先「拉取模型列表」
+        toast('info', '白名单还是空的', '它现在服务所有模型；想收窄就用表单里的「拉取模型列表」按上游真实 id 勾选', 9000);
+      }
       navigate('channels');
     } catch (error) {
       errorLine.textContent = error.message;
@@ -1636,8 +2068,11 @@ function channelForm(channel) {
         errorLine)),
     form,
     el('div', { class: 'row' }, save, cancel,
-      editing ? el('button', { class: 'btn', onclick: () => probeChannel(channel, true) }, '运行探针') : null,
-      editing ? el('button', { class: 'btn', onclick: () => fetchChannelModels(channel) }, '拉取模型列表') : null)));
+      el('button', {
+        class: 'btn', type: 'button',
+        onclick: () => pullModelsForForm(inputs, inputs.models, editing ? channel : null),
+      }, '拉取模型列表'),
+      editing ? el('button', { class: 'btn', onclick: () => probeChannel(channel, true) }, '运行探针') : null)));
 }
 
 async function probeChannel(channel, stay) {
@@ -1655,25 +2090,73 @@ async function probeChannel(channel, stay) {
   }
 }
 
+/** 记住上游真实 id：它们既是候选，也说明这家到底有哪些模型。 */
+function rememberModels(items) {
+  (items || []).forEach((item) => {
+    if (item.id && !state.pulledModels.includes(item.id)) state.pulledModels.push(item.id);
+  });
+  refreshModelDatalist();
+}
+
+/** 已保存渠道：拉一次上游列表，弹窗里逐个/一键写进白名单。 */
 async function fetchChannelModels(channel) {
   try {
     const data = await api.get(`${ADMIN}/channels/${channel.channel_id}/models`);
-    if (!data.items.length) { toast('warn', '上游没有返回模型列表', '该协议可能不支持 /models，可手动填写白名单'); return; }
-    openModal('上游可用模型 · ' + channel.name,
-      el('div', { class: 'stack' },
-        el('p', { class: 'panel__hint', text: '点「加入白名单」把模型 id 追加到该渠道的白名单，或全选复制。' }),
-        el('div', { class: 'row' }, data.items.map((item) => el('button', {
-          class: 'chip chip--mono', style: { cursor: 'pointer' },
-          onclick: () => {
-            const current = channel.models || [];
-            if (!current.includes(item.id)) current.push(item.id);
-            api.put(`${ADMIN}/channels/${channel.channel_id}`, { models: current })
-              .then(() => toast('ok', '已加入白名单', item.id))
-              .catch((error) => toast('err', '更新失败', error.message));
-          },
-        }, item.id, el('span', { class: 'panel__hint', text: item.owned_by ? ' · ' + item.owned_by : '' })))),
-        el('div', { class: 'codetext', text: data.items.map((item) => item.id).join('\n') })),
-      [el('button', { class: 'btn', text: '关闭', onclick: () => closeModal() })]);
+    if (!data.items.length) { toast('warn', '上游没有返回模型列表', '该协议可能不支持 /models，可手输或按通配填白名单'); return; }
+    rememberModels(data.items);
+    // 上游列表动辄几十条，一条一个 PUT 既慢又吵（还会刷出几十条提示）。
+    // 这里先在内存里攒着，关弹窗时一次性存——所以「加入」只是加进草稿，不是立即落库。
+    const draft = (channel.models || []).slice();
+    let pending = 0;
+    let saving = false;
+    const flush = async () => {
+      if (!pending || saving) return;
+      saving = true;
+      const count = pending;
+      pending = 0;
+      try {
+        await api.put(`${ADMIN}/channels/${channel.channel_id}`, { models: draft });
+        toast('ok', '白名单已更新', `新加入 ${count} 个模型，共 ${draft.length} 个`);
+        if ($('#drawer-root').hidden) navigate('channels');
+      } catch (error) {
+        pending = count;   // 没存上就留着，下次关弹窗时还有机会
+        toast('err', '白名单保存失败', error.message);
+      } finally {
+        saving = false;
+        if (pending) flush();
+      }
+    };
+    showModelsModal('上游可用模型 · ' + channel.name, data.items, (id) => {
+      if (draft.includes(id)) return;
+      draft.push(id);
+      pending += 1;
+    }, flush);
+  } catch (error) {
+    toast('err', '拉取模型失败', error.message);
+  }
+}
+
+/** 渠道表单里拉上游列表：新建时渠道还没落库，所以走「按表单值预览」的接口。 */
+async function pullModelsForForm(inputs, picker, channel) {
+  const baseUrl = inputs.base_url.value.trim();
+  if (!baseUrl) { toast('warn', '先填上游 base_url', '拉取模型列表需要知道问谁要列表'); inputs.base_url.focus(); return; }
+  const apiKey = inputs.api_key.value.trim();
+  if (!apiKey && !channel) { toast('warn', '先填上游 API Key', '大多数厂商的 /models 需要鉴权'); inputs.api_key.focus(); return; }
+  try {
+    const data = await api.post(`${ADMIN}/channels/models/preview`, {
+      provider_type: inputs.provider_type.value,
+      base_url: baseUrl,
+      api_key: apiKey,
+      channel_id: channel ? channel.channel_id : '',
+    });
+    if (!data.items.length) { toast('warn', '上游没有返回模型列表', '该协议可能不支持 /models，可手输或按通配填白名单'); return; }
+    rememberModels(data.items);
+    showModelsModal('上游可用模型 · ' + (channel ? channel.name : '尚未保存的新渠道'), data.items, (id) => {
+      const before = picker.getValues().length;
+      picker.add(id);
+      toast(before === picker.getValues().length ? 'info' : 'ok',
+        before === picker.getValues().length ? '已经在白名单里了' : '已加入白名单', id);
+    });
   } catch (error) {
     toast('err', '拉取模型失败', error.message);
   }
@@ -1802,7 +2285,7 @@ function keyForm(key) {
     quotaMoney: textInput(key && key.quota_limit ? String(key.quota_limit / 1e6) : '', { placeholder: '也可以直接填金额（美元）' }),
     rpm: numberInput(key ? key.rpm_limit : 0, { min: 0, step: 1 }),
     tpm: numberInput(key ? key.tpm_limit : 0, { min: 0, step: 1 }),
-    models: tagInput(key ? key.model_allowed : []),
+    models: modelPicker(key ? key.model_allowed : []),
     expires: textInput(key && key.expires_at ? key.expires_at.slice(0, 10) : '', { type: 'date' }),
     status: selectInput([{ value: 'active', label: '启用' }, { value: 'disabled', label: '禁用' }], key ? key.status : 'active'),
   };
@@ -1868,7 +2351,7 @@ function keyForm(key) {
         field('TPM 上限', inputs.tpm, '每分钟 token 数，0 不限'),
         field('过期日期', inputs.expires, '留空表示长期有效'),
         field('状态', inputs.status)),
-      el('div', { class: 'span-2' }, field('允许的模型', inputs.models, '留空表示允许全部；支持通配，如 fast、claude-*')),
+      el('div', { class: 'span-2' }, field('允许的模型', inputs.models, '留空表示允许全部；可从下拉选已知模型，也支持通配，如 fast、claude-*')),
       errorLine,
       revealHost),
     [save, cancel]);
@@ -2147,7 +2630,7 @@ async function viewModels(host, token) {
       el('button', { class: 'btn', onclick: () => importMaps() }, '批量导入'),
       el('button', { class: 'btn btn--primary', onclick: () => mapForm(null) }, icon('plus', 15), ' 新增映射'))));
 
-  const probeInput = textInput('', { placeholder: '输入一个模型名，看它会走哪条渠道', class: 'mono', style: { width: '260px' } });
+  const probeInput = modelInput('', { placeholder: '输入或下拉选一个模型名，看它会走哪条渠道', style: { width: '260px' } });
   const probeResult = el('div', { class: 'stack' });
   const runProbe = async () => {
     const model = probeInput.value.trim();
@@ -2198,8 +2681,8 @@ async function viewModels(host, token) {
 function mapForm(item) {
   const editing = !!item;
   const inputs = {
-    alias: textInput(item ? item.alias : '', { placeholder: 'fast 或 claude-*', class: 'mono' }),
-    upstream: textInput(item ? item.upstream_model : '', { placeholder: 'deepseek-v4-flash', class: 'mono' }),
+    alias: textInput(item ? item.alias : '', { placeholder: 'fast 或 claude-*', class: 'mono', list: refreshAliasDatalist() }),
+    upstream: modelInput(item ? item.upstream_model : '', { placeholder: 'deepseek-v4-flash，可从下拉选' }),
     channel: selectInput([{ value: '', label: '自动路由（不绑定）' }].concat(state.channels.map((channel) => ({ value: channel.channel_id, label: channel.name }))), item ? item.channel_id || '' : ''),
     provider: selectInput([{ value: '', label: '不限协议' }].concat((state.providers.length ? state.providers : []).map((provider) => ({ value: provider.type, label: provider.label }))), item ? item.provider_type || '' : ''),
     note: textInput(item ? item.note : ''),
@@ -2216,7 +2699,7 @@ function mapForm(item) {
       channel_id: inputs.channel.value || null,
       provider_type: inputs.provider.value,
       note: inputs.note.value.trim(),
-      enabled: inputs.enabled.querySelector('input').checked,
+      enabled: toggleValue(inputs.enabled),
     };
     if (!payload.alias || !payload.upstream_model) {
       errorLine.textContent = '别名与上游模型 id 都要填写';
@@ -2320,7 +2803,6 @@ async function viewStats(host, token) {
   const logs = await api.get(`${ADMIN}/stats/logs?limit=200${state.logFilter.status ? '&status=' + state.logFilter.status : ''}${state.logFilter.model ? '&model=' + encodeURIComponent(state.logFilter.model) : ''}`);
   if (token !== state.navToken) return;
 
-  const overview = stats.overview || {};
   const container = el('div', { class: 'stack' });
   container.appendChild(el('div', { class: 'view__head' },
     el('div', { class: 'view__title' },
@@ -2335,56 +2817,82 @@ async function viewStats(host, token) {
 
   container.appendChild(statsFilterBar(() => navigate('stats')));
 
-  container.appendChild(el('div', { class: 'grid grid--kpi' },
+  container.appendChild(el('div', { class: 'grid grid--kpi', 'data-role': 'stats-kpis' }, statsKpis(stats)));
+  container.appendChild(el('div', { class: 'grid grid--2', 'data-role': 'stats-charts' }, statsCharts(stats)));
+  container.appendChild(el('div', { class: 'grid grid--3', 'data-role': 'stats-breakdown' }, statsBreakdown(stats)));
+
+  const logFilter = selectInput([{ value: '', label: '全部状态' }, { value: 'ok', label: '仅成功' }, { value: 'error', label: '仅失败' }], state.logFilter.status, {
+    style: { width: '120px' }, onchange: (event) => { state.logFilter.status = event.target.value; navigate('stats'); },
+  });
+  const logsPanel = panel('请求明细', statsLogsTable(logs),
+    { flush: true, index: 5, actions: el('div', { class: 'row' }, logFilter) });
+  logsPanel.dataset.role = 'stats-logs';
+  container.appendChild(logsPanel);
+
+  host.replaceChildren(container);
+  state.logsSignature = logsSignature(logs);
+  startStatsPoller(() => {
+    paintStatsStats();
+    refreshRecentLogs();
+  });
+}
+
+function statsKpis(stats) {
+  const overview = (stats && stats.overview) || {};
+  return [
     kpiCard({ key: '请求数', value: fmt.int(overview.requests), foot: el('span', { text: `其中流式 ${overview.streamed || 0}` }), index: 0 }),
     kpiCard({ key: '错误数', value: fmt.int(overview.errors), accent: 'var(--rose)', foot: el('span', { text: '错误率 ' + fmt.pct(overview.error_rate || 0) }), index: 1 }),
     kpiCard({ key: 'Token 总量', value: fmt.int(overview.total_tokens), foot: el('span', { text: `输入 ${fmt.int(overview.prompt_tokens)} · 输出 ${fmt.int(overview.completion_tokens)}` }), accent: 'var(--violet)', index: 2 }),
     kpiCard({ key: '平均首字', value: fmt.ms(overview.avg_first_token_ms), foot: el('span', { text: '流式首包延迟' }), index: 3 }),
     kpiCard({ key: '平均速度', value: overview.avg_speed_tok_s ? overview.avg_speed_tok_s.toFixed(1) : '—', unit: 'tok/s', accent: 'var(--amber)', index: 4 }),
-    kpiCard({ key: '活跃密钥', value: fmt.int(overview.active_keys), foot: el('span', { text: `窗口内出现过用量的密钥` }), index: 5 })));
+    kpiCard({ key: '活跃密钥', value: fmt.int(overview.active_keys), foot: el('span', { text: '窗口内出现过用量的密钥' }), index: 5 }),
+  ];
+}
 
-  const chartRow = el('div', { class: 'grid grid--2' });
-  chartRow.appendChild(panel('Token 趋势', tokenChartBlock(stats), {
-    index: 0,
-    actions: el('span', { class: 'panel__hint', text: '鼠标悬停查看该时间点明细' }),
-  }));
-  chartRow.appendChild(panel('请求与错误', requestChartBlock(stats), { index: 1 }));
-  container.appendChild(chartRow);
+function statsCharts(stats) {
+  return [
+    panel('Token 趋势', tokenChartBlock(stats), {
+      index: 0,
+      actions: el('span', { class: 'panel__hint', text: '鼠标悬停查看该时间点明细' }),
+    }),
+    panel('请求与错误', requestChartBlock(stats), { index: 1 }),
+  ];
+}
 
-  const breakdown = el('div', { class: 'grid grid--3' });
-  breakdown.appendChild(panel('按模型', (stats.by_model || []).length ? dataTable([
-    { title: '模型' }, { title: '请求', align: 'right' }, { title: 'Tokens', align: 'right' }, { title: '费用 µ$', align: 'right' },
-  ], stats.by_model.map((row) => el('tr', null,
-    el('td', { class: 'mono cell-ellip', text: row.model }),
-    el('td', { class: 'num mono', text: fmt.int(row.requests) }),
-    el('td', { class: 'num mono', text: fmt.int(row.tokens) }),
-    el('td', { class: 'num mono', text: fmt.int(row.cost_units) }))), { flush: true })
-    : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 2 }));
-  breakdown.appendChild(panel('按密钥', (stats.by_key || []).length ? dataTable([
-    { title: '密钥' }, { title: '请求', align: 'right' }, { title: 'Tokens', align: 'right' },
-  ], stats.by_key.map((row) => el('tr', null,
-    el('td', null, el('div', { class: 'tbl__name' }, el('strong', { text: row.name || '（已删除）' }), el('span', { class: 'tbl__sub', text: row.prefix || '' }))),
-    el('td', { class: 'num mono', text: fmt.int(row.requests) }),
-    el('td', { class: 'num mono', text: fmt.int(row.tokens) }))), { flush: true })
-    : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 3 }));
-  breakdown.appendChild(panel('按渠道', (stats.by_channel || []).length ? dataTable([
-    { title: '渠道' }, { title: '请求', align: 'right' }, { title: '速度', align: 'right' }, { title: '延迟', align: 'right' },
-  ], stats.by_channel.map((row) => el('tr', null,
-    el('td', null, el('div', { class: 'tbl__name' }, el('strong', { text: row.channel_name || '（已删除）' }), el('span', { class: 'tbl__sub', text: row.provider_type || '' }))),
-    el('td', { class: 'num mono', text: fmt.int(row.requests) }),
-    el('td', { class: 'num mono', text: row.avg_speed_tok_s ? row.avg_speed_tok_s.toFixed(1) : '—' }),
-    el('td', { class: 'num mono', text: fmt.ms(row.avg_latency_ms) }))), { flush: true })
-    : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 4 }));
-  container.appendChild(breakdown);
+function statsBreakdown(stats) {
+  return [
+    panel('按模型', (stats.by_model || []).length ? dataTable([
+      { title: '模型' }, { title: '请求', align: 'right' }, { title: 'Tokens', align: 'right' }, { title: '费用 µ$', align: 'right' },
+    ], stats.by_model.map((row) => el('tr', null,
+      el('td', { class: 'mono cell-ellip', text: row.model }),
+      el('td', { class: 'num mono', text: fmt.int(row.requests) }),
+      el('td', { class: 'num mono', text: fmt.int(row.tokens) }),
+      el('td', { class: 'num mono', text: fmt.int(row.cost_units) }))), { flush: true })
+      : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 2 }),
+    panel('按密钥', (stats.by_key || []).length ? dataTable([
+      { title: '密钥' }, { title: '请求', align: 'right' }, { title: 'Tokens', align: 'right' },
+    ], stats.by_key.map((row) => el('tr', null,
+      el('td', null, el('div', { class: 'tbl__name' }, el('strong', { text: row.name || '（已删除）' }), el('span', { class: 'tbl__sub', text: row.prefix || '' }))),
+      el('td', { class: 'num mono', text: fmt.int(row.requests) }),
+      el('td', { class: 'num mono', text: fmt.int(row.tokens) }))), { flush: true })
+      : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 3 }),
+    panel('按渠道', (stats.by_channel || []).length ? dataTable([
+      { title: '渠道' }, { title: '请求', align: 'right' }, { title: '速度', align: 'right' }, { title: '延迟', align: 'right' },
+    ], stats.by_channel.map((row) => el('tr', null,
+      el('td', null, el('div', { class: 'tbl__name' }, el('strong', { text: row.channel_name || '（已删除）' }), el('span', { class: 'tbl__sub', text: row.provider_type || '' }))),
+      el('td', { class: 'num mono', text: fmt.int(row.requests) }),
+      el('td', { class: 'num mono', text: row.avg_speed_tok_s ? row.avg_speed_tok_s.toFixed(1) : '—' }),
+      el('td', { class: 'num mono', text: fmt.ms(row.avg_latency_ms) }))), { flush: true })
+      : el('p', { class: 'panel__hint', text: '暂无数据' }), { flush: true, index: 4 }),
+  ];
+}
 
-  const logFilter = selectInput([{ value: '', label: '全部状态' }, { value: 'ok', label: '仅成功' }, { value: 'error', label: '仅失败' }], state.logFilter.status, {
-    style: { width: '120px' }, onchange: (event) => { state.logFilter.status = event.target.value; navigate('stats'); },
-  });
-  container.appendChild(panel('请求明细', dataTable([
+function statsLogsTable(logs) {
+  return dataTable([
     { title: '时间' }, { title: '模型' }, { title: '密钥' }, { title: '渠道' }, { title: 'Tokens', align: 'right' },
     { title: '首字', align: 'right' }, { title: '速度', align: 'right' }, { title: '耗时', align: 'right' },
     { title: '流式' }, { title: '状态' }, { title: '消耗 µ$', align: 'right' },
-  ], (logs.items || []).map((row) => el('tr', null,
+  ], ((logs && logs.items) || []).map((row) => el('tr', null,
     el('td', { class: 'mono', text: fmt.dt(row.ts) }),
     el('td', { class: 'mono cell-ellip', text: row.model }),
     el('td', { text: row.key_name || row.key_prefix || '—' }),
@@ -2397,10 +2905,35 @@ async function viewStats(host, token) {
     el('td', { class: 'num mono', text: fmt.ms(row.latency_ms) }),
     el('td', null, row.stream ? chip('流式', 'mono') : chip('同步', 'off')),
     el('td', null, row.status === 'ok' ? chip('成功', 'ok') : chip(row.error_code || '失败', 'err')),
-    el('td', { class: 'num mono', text: fmt.int(row.cost_units) }))), { flush: true, wrapClass: 'tablewrap--tall' }),
-    { flush: true, index: 5, actions: el('div', { class: 'row' }, logFilter) }));
+    el('td', { class: 'num mono', text: fmt.int(row.cost_units) }))), { flush: true, wrapClass: 'tablewrap--tall' });
+}
 
-  host.replaceChildren(container);
+function paintStatsStats() {
+  const stats = state.stats || {};
+  repaint('[data-role="stats-kpis"]', statsKpis(stats));
+  repaint('[data-role="stats-charts"]', statsCharts(stats));
+  repaint('[data-role="stats-breakdown"]', statsBreakdown(stats));
+}
+
+/** 明细表只在真的有新请求时才重建：否则每次刷新都会把滚动位置顶回顶部。 */
+function logsSignature(logs) {
+  const items = (logs && logs.items) || [];
+  return items.length ? `${items.length}|${items[0].log_id}` : '0';
+}
+
+async function refreshRecentLogs() {
+  const query = new URLSearchParams({ limit: '200' });
+  if (state.logFilter.status) query.set('status', state.logFilter.status);
+  if (state.logFilter.model) query.set('model', state.logFilter.model);
+  try {
+    const logs = await api.get(`${ADMIN}/stats/logs?${query.toString()}`);
+    const signature = logsSignature(logs);
+    if (signature === state.logsSignature) return;
+    state.logsSignature = signature;
+    repaint('[data-role="stats-logs"] .panel__body', [statsLogsTable(logs)]);
+  } catch (_) {
+    // 同上：刷新失败不动已有画面
+  }
 }
 
 function windowSegmented(onPick) {
@@ -2550,13 +3083,15 @@ async function viewSettings(host, token) {
         control = numberInput(value, { step: spec.type === 'float' ? 'any' : 1, min: spec.minimum !== null && spec.minimum !== undefined ? spec.minimum : undefined, max: spec.maximum !== null && spec.maximum !== undefined ? spec.maximum : undefined });
         control.addEventListener('change', () => onChange(spec.type === 'int' ? Number(control.value) : parseFloat(control.value)));
       } else if (spec.type === 'json') {
-        control = el('textarea', { class: 'mono', value: typeof value === 'string' ? value : JSON.stringify(value, null, 2) });
-        control.addEventListener('change', () => {
-          try { onChange(JSON.parse(control.value || '{}')); control.style.borderColor = ''; }
-          catch (_) { control.style.borderColor = 'var(--rose)'; }
+        const textarea = el('textarea', { class: 'mono', value: typeof value === 'string' ? value : JSON.stringify(value, null, 2) });
+        textarea.addEventListener('change', () => {
+          try { onChange(JSON.parse(textarea.value || '{}')); textarea.style.borderColor = ''; }
+          catch (_) { textarea.style.borderColor = 'var(--rose)'; }
         });
+        control = spec.key === 'pricing.models' ? pricingEditor(textarea) : textarea;
       } else {
-        control = textInput(value);
+        const modelish = /(model|alias)/i.test(spec.key);
+        control = modelish ? modelInput(value) : textInput(value);
         control.addEventListener('change', () => onChange(control.value));
       }
       body.appendChild(el('div', { class: 'field' },
@@ -2678,7 +3213,30 @@ async function loadSystem() {
   state.providers = state.system.providers || [];
 }
 
+/** 把「静默失败」变成看得见：任何未捕获的脚本错误都弹一条提示。
+ *
+ * 事件处理器里抛异常时浏览器只在控制台留一行，页面上毫无反应——用户看到的就是
+ * 「点了没反应／按钮没反应」，而这类问题排查起来最费时间（新建渠道表单就踩过一次：
+ * 读一个被挪走的开关节点，抛 TypeError，请求根本没发出去）。同样的消息 5 秒内只弹一次，
+ * 免得某处持续报错时刷屏。 */
+function installErrorSurface() {
+  const seen = new Map();
+  const report = (detail) => {
+    const key = String(detail);
+    const now = Date.now();
+    if (seen.has(key) && now - seen.get(key) < 5000) return;
+    seen.set(key, now);
+    try { toast('err', '界面报错（请把这条发给维护者）', key, 12000); } catch (_) { /* toast 自身出错就不再递归 */ }
+  };
+  window.addEventListener('error', (event) => report(event.message || event.error || '未知脚本错误'));
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason;
+    report((reason && (reason.message || reason)) || '未知脚本错误');
+  });
+}
+
 async function boot() {
+  installErrorSurface();
   // 主题
   const savedTheme = localStorage.getItem('airelay.theme');
   if (savedTheme) document.documentElement.dataset.theme = savedTheme;
@@ -2739,6 +3297,7 @@ async function start() {
   buildRail();
   paintSignal();
   connectLive();
+  loadCatalog(false);  // 模型候选（读缓存，不阻塞首屏）；拉不到的渠道不影响使用
   const hash = (location.hash || '').replace('#/', '');
   await navigate(VIEWS.some((view) => view.id === hash) ? hash : 'dashboard');
   window.addEventListener('hashchange', () => {

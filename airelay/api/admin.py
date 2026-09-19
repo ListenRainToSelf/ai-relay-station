@@ -381,6 +381,32 @@ async def channel_models(channel_id: str, request: Request, session: Any = Depen
     return {"items": models, "total": len(models)}
 
 
+@router.post("/channels/models/preview")
+async def channel_models_preview(
+    payload: schemas.ModelsPreviewPayload, request: Request, session: Any = Depends(db_session)
+):
+    """按表单里还没保存的值拉一次上游模型列表。
+
+    新建渠道时渠道 id 还不存在，可用户恰在这一刻要照着上游真实 id 填白名单，
+    所以这里不落库、只按表单值现建适配器问一次 /models。
+    """
+    ctx = request.app.state.ctx
+    if ctx.http is None:
+        raise bad_request("网关尚未完成初始化")
+    api_key = payload.api_key.strip()
+    if not api_key and payload.channel_id:
+        # 编辑已有渠道时密钥框留空表示「不修改」，沿用库里那把
+        record = await ctx.channels.get(session, payload.channel_id)
+        api_key = ctx.channels.cipher.try_decrypt(record.api_key_enc or "")
+    models = await ctx.channels.fetch_models_preview(
+        provider_type=payload.provider_type,
+        base_url=payload.base_url.strip(),
+        api_key=api_key,
+        client=ctx.http,
+    )
+    return {"items": models, "total": len(models)}
+
+
 @router.post("/channels/{channel_id}/reset-cooldown")
 async def reset_channel_cooldown(channel_id: str, request: Request, session: Any = Depends(db_session)):
     ctx = request.app.state.ctx
@@ -396,6 +422,39 @@ async def reset_channel_cooldown(channel_id: str, request: Request, session: Any
 async def list_model_map(request: Request, session: Any = Depends(db_session)):
     ctx = request.app.state.ctx
     return {"items": await ctx.mapping.list_maps(session)}
+
+
+@router.get("/models/catalog")
+async def models_catalog(
+    request: Request,
+    session: Any = Depends(db_session),
+    refresh: bool = Query(False, description="为真时并发去上游拉一遍模型列表，否则只读缓存"),
+):
+    """控制台所有「填模型名」处的候选来源：按渠道分组 + 别名 + 去重全集。
+
+    进表单时用 refresh=false（秒回，读的是缓存），用户点「刷新上游模型」时才
+    真去问上游——上游可能有几十个模型、也可能限流，不该让打开表单这个动作去等它。
+    """
+    ctx = request.app.state.ctx
+    entries = await ctx.channels.models_catalog(session, client=ctx.http, refresh=refresh)
+    aliases = [
+        {"alias": item["alias"], "upstream_model": item["upstream_model"], "channel_id": item.get("channel_id")}
+        for item in await ctx.mapping.list_maps(session)
+    ]
+    models: set[str] = set()
+    for entry in entries:
+        models.update(entry["models"])
+        models.update(entry["upstream_ids"])
+    for item in aliases:
+        models.add(item["alias"])
+        if item["upstream_model"]:
+            models.add(item["upstream_model"])
+    return {
+        "aliases": aliases,
+        "channels": entries,
+        "models": sorted(models),
+        "refreshed": bool(refresh),
+    }
 
 
 @router.post("/models/map")

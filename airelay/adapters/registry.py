@@ -13,11 +13,12 @@ from .base import BaseAdapter
 from .gemini import GeminiAdapter
 from .base import CAPABILITY_LABELS
 from .mimo import XiaomiMiMoAdapter
-from .openai import DeepSeekAdapter, GenericOpenAIAdapter, OpenAIAdapter
+from .openai import DeepSeekAdapter, GenericOpenAIAdapter, OpenAIAdapter, ZhipuAdapter
 
 ADAPTERS: dict[str, type[BaseAdapter]] = {
     OpenAIAdapter.provider_type: OpenAIAdapter,
     DeepSeekAdapter.provider_type: DeepSeekAdapter,
+    ZhipuAdapter.provider_type: ZhipuAdapter,
     AnthropicAdapter.provider_type: AnthropicAdapter,
     GeminiAdapter.provider_type: GeminiAdapter,
     XiaomiMiMoAdapter.provider_type: XiaomiMiMoAdapter,
@@ -36,6 +37,9 @@ PROVIDER_ALIASES = {
     "custom": "openai-compatible",
     "compatible": "openai-compatible",
     "ds": "deepseek",
+    "glm": "zhipu",
+    "zhipuai": "zhipu",
+    "bigmodel": "zhipu",
     "mimo": "xiaomi-mimo",
     "xiaomi": "xiaomi-mimo",
     "xiaomimimo": "xiaomi-mimo",
@@ -74,6 +78,7 @@ def provider_metadata() -> list[dict[str, Any]]:
     base = {
         "openai": "https://api.openai.com/v1",
         "deepseek": "https://api.deepseek.com/v1",
+        "zhipu": "https://open.bigmodel.cn/api/paas/v4",
         "anthropic": "https://api.anthropic.com",
         "gemini": "https://generativelanguage.googleapis.com",
         "xiaomi-mimo": "https://api.xiaomimimo.com/v1",

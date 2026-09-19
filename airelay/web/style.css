@@ -374,6 +374,28 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .taginput input { border: 0; background: transparent; padding: 3px 2px; flex: 1; min-width: 90px; box-shadow: none !important; }
 .taginput input:focus { box-shadow: none; }
 
+/* -------------------------------------------------- 模型候选面板（按渠道分组）
+   白名单这类地方既要「看到全部模型」，也要知道每个模型是哪家的；datalist 只有一列
+   扁平名字给不了分组，所以自绘面板，位置跟着输入框往下走，不遮挡下面的字段。 */
+.pickwrap { position: relative; }
+.modelpick {
+  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0; right: 0;
+  max-height: 320px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: var(--radius-sm);
+  box-shadow: 0 24px 60px -30px #000; padding: 8px 10px 6px;
+}
+.modelpick[hidden] { display: none; }
+.modelpick__group + .modelpick__group { margin-top: 9px; }
+.modelpick__title { display: flex; align-items: baseline; gap: 8px; font-size: 11px; color: var(--ink-dim); margin-bottom: 5px; }
+.modelpick__title > span:first-child { font-weight: 600; color: var(--ink); }
+.modelpick__grid { display: flex; flex-wrap: wrap; gap: 5px; }
+.modelpick__grid .chip { cursor: pointer; }
+.modelpick__grid .chip[data-hot="true"] { border-color: var(--cyan); color: var(--cyan); }
+.modelpick__foot {
+  display: flex; align-items: center; gap: 8px; margin-top: 10px; padding-top: 7px;
+  border-top: 1px solid var(--line); position: sticky; bottom: 0; background: var(--panel);
+}
+
 /* ---------------------------------------------------------------- 标签与徽记 */
 .chip {
   display: inline-flex; align-items: center; gap: 5px;

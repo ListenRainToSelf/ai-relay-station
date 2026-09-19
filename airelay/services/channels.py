@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -42,6 +43,12 @@ class ChannelService:
     def __init__(self, *, cipher: SecretBox, settings: SettingsService) -> None:
         self.cipher = cipher
         self.settings = settings
+        # 上游模型列表缓存：channel_id -> (取回时刻, items)。
+        # 「填模型名」的下拉要看到所有模型，就得认识每个渠道的上游列表；逐个实时拉一遍
+        # 又慢又容易被上游限流，所以拉到的结果留在内存里复用（进程重启即失效）。
+        self._models_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
+        # 每个渠道最近一次拉取失败的说明（成功的渠道会被清掉），给下拉里做个标记
+        self._models_errors: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 查询
     async def list_channels(
@@ -348,7 +355,36 @@ class ChannelService:
         }
 
     async def fetch_models(self, channel: Channel, *, client: httpx.AsyncClient) -> list[dict[str, Any]]:
-        adapter = self.adapter_for(channel)
+        """拉某个渠道的上游模型列表（手动触发，永远实时取），顺便更新缓存。"""
+        items = await self._list_models(self.adapter_for(channel), client)
+        self._models_cache[channel.channel_id] = (utcnow(), items)
+        return items
+
+    async def fetch_models_preview(
+        self,
+        *,
+        provider_type: str,
+        base_url: str,
+        api_key: str,
+        client: httpx.AsyncClient,
+        extra_headers: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """按「还没落库的表单值」拉一次上游模型列表。
+
+        新建渠道时渠道 id 还不存在，拿不到记录，但用户恰恰在这个时刻最需要候选
+        （白名单就是照着上游真实 id 填的），所以这里按表单里的协议/地址/密钥现建一个适配器。
+        """
+        adapter = create_adapter(
+            normalize_provider(provider_type),
+            api_key=api_key,
+            base_url=base_url,
+            extra_headers=extra_headers or {},
+            extra_body=extra_body or {},
+        )
+        return await self._list_models(adapter, client)
+
+    async def _list_models(self, adapter: BaseAdapter, client: httpx.AsyncClient) -> list[dict[str, Any]]:
         call = adapter.build_models_call()
         if call is None:
             return []
@@ -362,6 +398,63 @@ class ChannelService:
         except ValueError:
             return []
         return adapter.normalize_models(payload)
+
+    async def models_catalog(
+        self, session: AsyncSession, *, client: httpx.AsyncClient | None, refresh: bool = False
+    ) -> list[dict[str, Any]]:
+        """每个渠道一条：渠道白名单 + 上游真实模型列表（带缓存）。
+
+        refresh=False 时只读缓存（进表单时调用，必须秒回）；refresh=True 时并发去拉。
+        单个渠道失败只记在自己的 upstream_error 里，不影响别的渠道——上游限流、离线、
+        协议不支持 /models 都很常见，不该让整张目录空掉。
+        """
+        channels = list((await session.execute(select(Channel).order_by(Channel.priority, Channel.name))).scalars().all())
+        ttl = max(60, self.settings.get_int("services.catalog_ttl_seconds", 600))
+        now = utcnow()
+
+        def is_stale(channel: Channel) -> bool:
+            cached = self._models_cache.get(channel.channel_id)
+            if cached is None:
+                return True
+            return (now - cached[0]).total_seconds() > ttl
+
+        if refresh and client is not None:
+            pending = [c for c in channels if c.status == STATUS_ACTIVE]
+
+            async def pull(channel: Channel) -> None:
+                try:
+                    items = await self._list_models(self.adapter_for(channel), client)
+                except Exception as error:  # noqa: BLE001 —— 单渠道失败不拖垮目录
+                    log.info("模型目录：渠道「%s」拉取上游列表失败：%s", channel.name, error)
+                    self._models_errors[channel.channel_id] = str(error)
+                    # 失败也要记时刻，否则每次进表单都会重试一遍慢上游
+                    self._models_cache.setdefault(channel.channel_id, (now, []))
+                    self._models_cache[channel.channel_id] = (now, self._models_cache[channel.channel_id][1])
+                    return
+                self._models_cache[channel.channel_id] = (now, items)
+                self._models_errors.pop(channel.channel_id, None)
+
+            if pending:
+                await asyncio.gather(*(pull(channel) for channel in pending))
+
+        entries: list[dict[str, Any]] = []
+        for channel in channels:
+            cached = self._models_cache.get(channel.channel_id)
+            upstream = list(cached[1]) if cached else []
+            entries.append({
+                "channel_id": channel.channel_id,
+                "name": channel.name,
+                "provider_type": channel.provider_type,
+                "status": channel.status,
+                "models": channel.model_patterns(),
+                "upstream": upstream,
+                # 下拉候选只认 id；owned_by 这类字段留给单渠道的模型列表接口
+                "upstream_ids": [str(item.get("id") or "") for item in upstream if item.get("id")],
+                "upstream_at": to_iso(cached[0]) if cached else "",
+                "upstream_stale": is_stale(channel),
+                "upstream_error": self._models_errors.get(channel.channel_id, ""),
+            })
+        return entries
 
 
 def _json_list(value: Any, field: str) -> str:

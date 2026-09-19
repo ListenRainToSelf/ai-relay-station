@@ -64,6 +64,7 @@ STATE: dict[str, Any] = {
     "delay": 0.0,
     "stream_delay": 0.0,
     "stream_chunks": 3,
+    "reply_text": "",                     # 非空则覆盖 REPLY_TEXT（造长回答用）
     "require_assistant_for_tts": True,   # 模拟 MiMo：TTS 必须把文本放 assistant
     "tts_voice_validator": True,          # 音色不在清单里就 400
     "valid_voices": ["mimo_default", "冰糖", "茉莉"],
@@ -91,6 +92,7 @@ def reset_state() -> None:
             "delay": 0.0,
             "stream_delay": 0.0,
             "stream_chunks": 3,
+            "reply_text": "",   # 空 = 用 REPLY_TEXT
         }
     )
 
@@ -215,6 +217,9 @@ def create_app() -> FastAPI:
 
     @app.get("/v1/models")
     async def openai_models():
+        failed = await _gate("/v1/models", None)
+        if failed is not None:
+            return failed
         return {
             "object": "list",
             "data": [
@@ -371,7 +376,7 @@ def _openai_payload(model: str, body: dict[str, Any]) -> dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": REPLY_TEXT},
+                "message": {"role": "assistant", "content": _reply_text()},
                 "finish_reason": "stop",
             }
         ],
@@ -548,11 +553,18 @@ async def _gemini_stream(model: str):
     )
 
 
+def _reply_text() -> str:
+    """本次回复正文；`STATE["reply_text"]` 可覆盖，用来造「长回答 + 很多块」的场景。"""
+    override = STATE.get("reply_text")
+    return str(override) if override else REPLY_TEXT
+
+
 def _split_reply(count: int) -> list[str]:
     """把回复切成 count 片，保证拼回来与原文完全一致。"""
-    count = max(1, min(int(count), len(REPLY_TEXT)))
-    size = -(-len(REPLY_TEXT) // count)  # 向上取整
-    return [REPLY_TEXT[i : i + size] for i in range(0, len(REPLY_TEXT), size)]
+    text = _reply_text()
+    count = max(1, min(int(count), len(text)))
+    size = -(-len(text) // count)  # 向上取整
+    return [text[i : i + size] for i in range(0, len(text), size)]
 
 
 def main() -> int:

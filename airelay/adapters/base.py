@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable
 
@@ -201,24 +202,60 @@ def audio_format_of(filename: str, content_type: str) -> str:
 # --------------------------------------------------------------------------- #
 # URL 拼接
 # --------------------------------------------------------------------------- #
-_VERSION_SEGMENTS = ("v1beta", "v1")
+# 版本段，形如 v1 / v4 / v1beta / v2alpha / v3preview。不能写死成枚举：
+# 智谱用的是 /api/paas/v4，只认 v1、v1beta 会直接 404。
+_VERSION_SEGMENT_RE = re.compile(r"^v\d+[a-z]*$")
+
+# 用户常把「某个具体端点」整条贴进 base_url，例如
+# https://open.bigmodel.cn/api/paas/v4/chat/completions。
+# 这些尾巴要先摘掉，否则会拼出 .../chat/completions/v1/chat/completions。
+_ENDPOINT_TAILS = (
+    "chat/completions",
+    "audio/transcriptions",
+    "images/generations",
+    "audio/speech",
+    "completions",
+    "embeddings",
+    "messages",
+    "responses",
+    "models",
+)
+
+
+def _version_segment(segment: str) -> str:
+    seg = (segment or "").strip()
+    return seg if _VERSION_SEGMENT_RE.match(seg.lower()) else ""
 
 
 def join_url(base: str, suffix: str) -> str:
-    """拼接 base_url 与路径，自动去重 `/v1`、`/v1beta` 段。
+    """拼接 base_url 与路径，容忍用户填写的各种 base_url 写法。
 
-    用户填的 base_url 可能是 `https://api.deepseek.com`、`.../v1`
-    或 `.../v1beta`，三种写法都要能正确落到目标端点。
+    同一条 `v1/chat/completions`，下面几种 base_url 都要落到同一个 URL：
+
+    - ``https://api.deepseek.com``
+    - ``https://api.deepseek.com/v1``
+    - ``https://open.bigmodel.cn/api/paas/v4``   → ``.../v4/chat/completions``
+    - ``https://open.bigmodel.cn/api/paas/v4/chat/completions``（整条端点）
+
+    两条规则：base 若已长着端点尾巴就摘掉；base 若自带版本段，则以 base 的
+    版本为准，去掉 suffix 里重复的那个（base 无版本段时才沿用 suffix 的）。
     """
-    base = (base or "").strip()
-    suffix = (suffix or "").lstrip("/")
+    base = (base or "").strip().rstrip("/")
+    suffix = (suffix or "").strip().lstrip("/")
     if not base:
         return suffix
-    base = base.rstrip("/")
-    for seg in _VERSION_SEGMENTS:
-        if base.endswith("/" + seg) and (suffix == seg or suffix.startswith(seg + "/")):
-            suffix = suffix[len(seg):].lstrip("/")
+    if not suffix:
+        return base
+
+    for tail in _ENDPOINT_TAILS:
+        if base.endswith("/" + tail):
+            base = base[: -len(tail) - 1]
             break
+
+    suffix_version = _version_segment(suffix.split("/", 1)[0])
+    if suffix_version and _version_segment(base.rsplit("/", 1)[-1]):
+        suffix = suffix[len(suffix_version):].lstrip("/")
+
     return f"{base}/{suffix}" if suffix else base
 
 
@@ -250,6 +287,20 @@ class Usage:
         }
 
 
+CJK_RANGES = (
+    (0x2E80, 0x9FFF),  # 中日韩部首、汉字（含扩展 A）
+    (0xAC00, 0xD7AF),  # 谚文音节
+    (0xFF00, 0xFFEF),  # 全角字符
+)
+
+# 删除表：把所有 CJK 码位映射成 None，交给 C 层的 str.translate 删掉。
+# 判定口径与逐字符比较完全一致，只是把循环从 Python 挪进了 C——
+# 40 万字符的 prompt 从 ~37ms 降到 ~10ms，而这类大 prompt 每次请求要算两三遍。
+_CJK_DELETE_TABLE = {
+    code: None for start, end in CJK_RANGES for code in range(start, end + 1)
+}
+
+
 def estimate_tokens(text: str | None) -> int:
     """粗略 token 估算：CJK 字符按 1 token，其余按 4 字符 1 token。
 
@@ -258,14 +309,45 @@ def estimate_tokens(text: str | None) -> int:
     """
     if not text:
         return 0
-    cjk = 0
-    other = 0
-    for ch in text:
-        if "\u2e80" <= ch <= "\u9fff" or "\uac00" <= ch <= "\ud7af" or "\uff00" <= ch <= "\uffef":
-            cjk += 1
-        else:
-            other += 1
+    total = len(text)
+    other = len(text.translate(_CJK_DELETE_TABLE))
+    cjk = total - other
     return cjk + max(0, math.ceil(other / 4))
+
+
+class TokenCounter:
+    """增量式 token 估算：每块只处理新增文本，整体 O(总长度)。
+
+    为什么需要它：流式转发里「已产出多少 token」要随块更新，最直白的写法是
+    `estimate_tokens("".join(已收文本))`——但那让成本变成 O(块数 × 全文长度)。
+    一次 1200 块、每块 30 字的回答要重复扫描两千多万字符，而这些计算跑在
+    服务的事件循环上：四个并发长回答就能把循环占满，控制台连页面都打不开。
+
+    这里把「CJK 计数」与「其余字符计数」分开累加，逐块只扫新增的那点文本，
+    最终 ceil 一次，数值与 `estimate_tokens(全文)` 完全相同。
+    """
+
+    __slots__ = ("_cjk", "_other")
+
+    def __init__(self) -> None:
+        self._cjk = 0
+        self._other = 0
+
+    def add(self, text: str | None) -> None:
+        if not text:
+            return
+        total = len(text)
+        other = len(text.translate(_CJK_DELETE_TABLE))
+        self._other += other
+        self._cjk += total - other
+
+    @property
+    def tokens(self) -> int:
+        return self._cjk + max(0, math.ceil(self._other / 4))
+
+    @property
+    def chars(self) -> int:
+        return self._cjk + self._other
 
 
 def estimate_messages_tokens(messages: Iterable[dict[str, Any]]) -> int:

@@ -111,6 +111,15 @@ class ProbePayload(Lenient):
     max_tokens: int = Field(128, ge=8, le=4096, description="探针的最大输出 token（推理模型建议 ≥128）")
 
 
+class ModelsPreviewPayload(Lenient):
+    """按「还没保存的表单值」拉一次上游模型列表（新建渠道时用）。"""
+
+    provider_type: str = Field("openai", min_length=1)
+    base_url: str = Field(..., min_length=1)
+    api_key: str = ""
+    channel_id: str = ""  # 可选：改一个已有渠道但还没保存时，凭它沿用库里的密钥
+
+
 class ModelMapCreate(Lenient):
     alias: str = Field(..., min_length=1)
     upstream_model: str = Field(..., min_length=1)

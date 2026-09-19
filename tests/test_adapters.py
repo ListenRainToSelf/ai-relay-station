@@ -7,7 +7,8 @@ import json
 import httpx
 import pytest
 
-from airelay.adapters import ChatRequest, create_adapter, estimate_tokens, join_url
+from airelay.adapters import ChatRequest, TokenCounter, create_adapter, estimate_tokens, join_url
+from airelay.adapters.media import ImageRequest
 from airelay.adapters.anthropic import (
     convert_messages,
     convert_tool_choice,
@@ -41,6 +42,36 @@ def _async_response(text: str) -> httpx.Response:
             "v1beta/models/gemini-2.5-flash:generateContent",
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
         ),
+        # 非 v1 的版本段（智谱是 /api/paas/v4）：base 的版本优先
+        (
+            "https://open.bigmodel.cn/api/paas/v4",
+            "v1/chat/completions",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        (
+            "https://open.bigmodel.cn/api/paas/v4",
+            "v1/models",
+            "https://open.bigmodel.cn/api/paas/v4/models",
+        ),
+        # 用户把整条端点 URL 贴进 base_url：先摘端点尾巴，再按 base 的版本拼
+        (
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "v1/chat/completions",
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        ),
+        (
+            "https://api.deepseek.com/v1/chat/completions",
+            "v1/chat/completions",
+            "https://api.deepseek.com/v1/chat/completions",
+        ),
+        # 媒体端点也一样：贴 chat 端点当 base，换端点时仍拼得对
+        (
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            "v1/images/generations",
+            "https://open.bigmodel.cn/api/paas/v4/images/generations",
+        ),
+        # base 无版本段：沿用 suffix 自己的版本段
+        ("https://open.bigmodel.cn", "v1/models", "https://open.bigmodel.cn/v1/models"),
         ("", "v1/models", "v1/models"),
     ],
 )
@@ -53,6 +84,50 @@ def test_estimate_tokens_prefers_cjk_weight() -> None:
     # 中文按字计，英文按 4 字符 1 token
     assert estimate_tokens("你好世界") == 4
     assert estimate_tokens("abcdefgh") == 2
+
+
+@pytest.mark.parametrize(
+    "code, is_cjk",
+    [
+        (0x2E7F, False), (0x2E80, True), (0x9FFF, True), (0xA000, False),
+        (0xABFF, False), (0xAC00, True), (0xD7AF, True), (0xD7B0, False),
+        (0xFEFF, False), (0xFF00, True), (0xFFEF, True), (0xFFF0, False),
+    ],
+)
+def test_estimate_tokens_cjk_boundaries(code: int, is_cjk: bool) -> None:
+    """估算改成 C 层删除表实现后，区段边界必须与原来逐字符比较完全一致。
+
+    判据用「4 个相同字符」：CJK 按字计 → 4，其余按 4 字符 1 token → 1。
+    单个字符两种口径都是 1，区分不出来。
+    """
+    char = chr(code)
+    assert estimate_tokens(char) == 1
+    assert estimate_tokens(char * 4) == (4 if is_cjk else 1)
+
+
+def test_token_counter_matches_full_text_estimate() -> None:
+    """增量累加的结果必须与「一次性估算全文」逐位相同——报表口径不能因为优化而漂。"""
+    text = "秋天的山林里落叶铺满了小路，风从谷底吹上来带着松脂的气味。code: def f() -> int: return 1." * 40
+    counter = TokenCounter()
+    for index in range(0, len(text), 7):        # 模拟按块到达，块长还不一样
+        counter.add(text[index:index + 7])
+    assert counter.tokens == estimate_tokens(text)
+    assert counter.chars == len(text)
+
+    empty = TokenCounter()
+    empty.add("")
+    empty.add(None)
+    assert empty.tokens == 0
+
+
+def test_token_counter_adds_only_new_text() -> None:
+    """每块只处理新增文本：扫描量随总长度线性增长，而不是块数 × 全文长度。"""
+    counter = TokenCounter()
+    piece = "你好世界" * 10
+    for _ in range(50):
+        counter.add(piece)
+    assert counter.chars == len(piece) * 50
+    assert counter.tokens == estimate_tokens(piece * 50)
 
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +182,38 @@ def test_deepseek_adapter_balance_url_from_base() -> None:
     assert normalized["currency"] == "CNY"
     assert normalized["total"] == 88.5
     assert normalized["granted"] == 8.5
+
+
+def test_zhipu_adapter_uses_v4_prefix_and_tolerates_pasted_endpoint() -> None:
+    """智谱的版本段是 /v4，且用户很可能把整条端点贴进 base_url。"""
+    request = ChatRequest.from_body(
+        {"model": "glm-4-flash", "messages": [{"role": "user", "content": "hi"}]}
+    )
+    for base_url in (
+        "https://open.bigmodel.cn/api/paas/v4",
+        "https://open.bigmodel.cn/api/paas/v4/",
+        "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    ):
+        adapter = create_adapter("zhipu", api_key="k", base_url=base_url)
+        chat = adapter.build_chat_call(request, "glm-4-flash", defaults={"max_tokens": 64})
+        assert chat.url == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        assert adapter.build_models_call().url == "https://open.bigmodel.cn/api/paas/v4/models"
+        images = adapter.build_image_call(
+            ImageRequest(model="cogview-3-flash", prompt="一只猫"), "cogview-3-flash", defaults={}
+        )
+        assert images.url == "https://open.bigmodel.cn/api/paas/v4/images/generations"
+
+
+def test_zhipu_provider_is_registered_with_preset() -> None:
+    from airelay.adapters.registry import normalize_provider, provider_metadata
+
+    assert normalize_provider("glm") == "zhipu"
+    assert normalize_provider("zhipuai") == "zhipu"
+    assert normalize_provider("bigmodel") == "zhipu"
+    entry = next(x for x in provider_metadata() if x["type"] == "zhipu")
+    assert entry["label"] == "智谱 GLM"
+    assert entry["default_base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+    assert "chat" in entry["capabilities"] and "images" in entry["capabilities"]
 
 
 # --------------------------------------------------------------------------- #

@@ -25,6 +25,7 @@
 - [配置项](#配置项)
 - [接口一览](#接口一览)
 - [运维与排障](#运维与排障)
+- [性能约定（改这几处代码前先读）](#性能约定改这几处代码前先读)
 - [开发与测试](#开发与测试)
 - [需求对照与实现边界](#需求对照与实现边界)
 
@@ -117,7 +118,7 @@ docker compose exec airelay python -m airelay --print-token   # 查管理员令�
 ## 第一次配置：三步接入
 
 1. 打开 `http://<地址>:8000/admin`，用管理员令牌登录（远程访问必须登录；本机环回地址会自动放行）。
-2. **渠道** → 新建渠道：填厂商给的 `base_url` 与 API Key，选协议（OpenAI 兼容 / DeepSeek / Claude / Gemini），按需填模型白名单。
+2. **渠道** → 新建渠道：填厂商给的 `base_url` 与 API Key，选协议（OpenAI 兼容 / DeepSeek / 智谱 GLM / Claude / Gemini / 小米 MiMo），按需填模型白名单。
    配完点「探针」确认连通。
 3. **密钥** → 创建密钥：得到一个 `sk-relay-...` 明文密钥（**只显示这一次**），设好配额与可用模型。把它填进客户端即可。
 
@@ -125,6 +126,26 @@ docker compose exec airelay python -m airelay --print-token   # 查管理员令�
 - **模型别名**：把 `claude-sonnet-4-5-20250929` 这类长 id 折叠成 `claude-4`，客户端只记短名；页面上有「路由试算」可以先验证会走哪条渠道。
 - **设置 → 计价**：填每个模型的每百万 token 单价，控制台就会显示预估费用；不填也能正常记账，只是费用恒为 0。
 - **余额**：DeepSeek 渠道开箱可用；其它厂商在渠道编辑里填自定义余额 URL 与取值路径。
+
+> **填模型名的地方都有下拉候选**（渠道白名单、密钥的允许模型、别名映射的上游模型、路由试算、
+> 设置里的兜底模型别名、计价表）。白名单这类多选输入点开是**按渠道分组**的面板：每个渠道一组，
+> 组标题上标出「上游可用 N 个 / 上游列表没拉到：原因 / 已禁用」，组里是该渠道白名单与上游真实 id 的
+> 并集——所以你想找的模型「是哪一家的」一眼就能看出来。面板带过滤框、↑↓ 选 + 回车加、
+> 右下角「刷新上游模型」（点它才真去问上游，平时读缓存）。候选只是提供方便，输入框仍然可以手输，
+> 通配符（`claude-*`）照旧。计价表的键就是模型名，上面那排「快捷添加」按钮能直接生成一条待填单价的
+> 条目，省得手打（单价键错一个字母只会悄悄不生效）。
+>
+> **新建渠道时也能拉模型**：表单里的「拉取模型列表」在**未保存**的新渠道上同样可用（走
+> `POST /api/admin/channels/models/preview`，直接用表单里还没落库的 `base_url` / API Key 去问上游），
+> 拉回来的列表里点模型名或「全部加入」就填进白名单标签；改已有渠道但还没保存时也可用，API Key
+> 留空会自动沿用库里存的那把。渠道列表每行的「白名单」按钮则是同一个弹窗的已保存版本。
+
+> **`base_url` 怎么写都行**。网关按「版本段 + 端点尾」自动拼接，下面几种写法等价：
+> `https://open.bigmodel.cn/api/paas/v4`、带末尾斜杠的 `.../api/paas/v4/`、
+> 甚至把厂商文档里那条完整端点 `https://open.bigmodel.cn/api/paas/v4/chat/completions` 整条粘进来。
+> 版本段不写死枚举——`v1`、`v1beta`、`v4`、`v2alpha` 都认（智谱用的正是 `v4`）；
+> 端点尾（`/chat/completions`、`/images/generations`、`/audio/speech`…）会被自动摘掉，
+> 免得拼成 `.../chat/completions/v1/chat/completions` 这种必然 404 的地址。
 
 ---
 
@@ -262,12 +283,13 @@ python -m airelay --set gateway.max_retries=2 --set logs.level=DEBUG   # 临时�
 
 ## 配置项
 
-控制台「设置」页按 10 组呈现，全部落 SQLite，改完立即生效（网络类会触发热重绑定）：
+控制台「设置」页按 11 组呈现，全部落 SQLite，改完立即生效（网络类会触发热重绑定）：
 
 | 分组 | 代表项 |
 | --- | --- |
 | 网络 | 服务 IP、服务端口、对外基地址、信任反代头、跨域白名单 |
 | 网关 | 请求总超时、建连超时、首字节超时、流式静默超时、换渠道重试次数、熔断冷却、默认 max_tokens |
+| 本地服务托管 | 托管总开关、默认探活间隔、随网关自动启动、网关退出时一并关闭、上游模型目录缓存秒数 |
 | 限流 | 全局 RPM / TPM、新建 Key 默认 RPM / TPM |
 | 会话监控 | 僵死判定秒数、推送开关与间隔、最近请求条数 |
 | 余额 | 自动刷新开关与间隔、低余额告警阈值 |
@@ -275,7 +297,7 @@ python -m airelay --set gateway.max_retries=2 --set logs.level=DEBUG   # 临时�
 | 计价 | 币种、模型单价表（每百万 token）、默认单价 |
 | 日志 | 级别、明细保留天数、访问日志开关 |
 | 安全 | 会话有效期、远程是否强制令牌、本地密钥前缀 |
-| 界面 | 主题、分页条数、开机自启 |
+| 外观与界面 | 主题、分页条数、开机自启 |
 
 数据目录（默认 Windows `%LOCALAPPDATA%\airelay`，Linux `~/.local/share/airelay`）里放三样东西：
 `airelay.db`（SQLite）、`logs/airelay.log`（滚动日志）、`secrets.json`（主密钥 + 管理员令牌 + 哈希 pepper，权限 0600）。
@@ -333,6 +355,11 @@ curl -sS http://127.0.0.1:8000/v1/images/generations \
 
 `/v1/models` 里能看到每个模型的能力，客户端可以据此决定要不要调语音接口。
 
+> **只写 glob 的渠道不会出现在 `/v1/models` 里**。`glm-*` 这类通配展开不成具体名字，
+> 列表只收录「别名」和「白名单里写死的模型名」。想让客户端下拉能选到，就把常用的具体 id
+> （如 `glm-4-flash` / `glm-4v-flash` / `cogview-3-flash`）一并写进白名单——和通配不冲突，
+> 通配继续负责「以后新出的模型自动放行」。
+
 ### 各家上游的实测差异（网关会替你翻译）
 
 同样是「语音合成」，三家上游的实现完全不同，适配器负责抹平：
@@ -344,6 +371,16 @@ curl -sS http://127.0.0.1:8000/v1/images/generations \
 | Google Gemini | `generateContent` + `responseModalities:["AUDIO"]`，返回**裸 PCM**，网关补 WAV 头 | `generateContent` 带 inlineData 音频，取回复文本 | `generateContent` + `["TEXT","IMAGE"]`；模型名含 `imagen` 的走 `:predict` |
 | Anthropic Claude | 不支持 | 不支持 | 不支持 |
 | DeepSeek | 不支持 | 不支持 | 不支持 |
+| 智谱 GLM | 原生 `POST /audio/speech`，模型要用 `cogtts`（`glm-4-voice` 不是 TTS 模型）；**未实测**，本账号免费额度不含 | 原生 `POST /audio/transcriptions`；同上未实测 | 原生 `POST /images/generations`（`cogview-*`），实测可用 |
+
+> **智谱 GLM 的三个实测细节**（`provider_type: zhipu`，预设 base_url `https://open.bigmodel.cn/api/paas/v4`）：
+> ① 端点前缀的版本段是 `v4`，早期网关只认 `v1`/`v1beta`，拼接时会把 `v4` 丢掉，
+> 表现成「配了渠道但一律 404」——现在按任意版本段识别，整条端点 URL 粘进来也能用；
+> ② 官方 `/models` 只返回 11 个 id（`glm-4.5` 到 `glm-5.3`），**不含**真正免费可用的
+> `glm-4-flash` / `glm-4v-flash`，所以它不能当能力清单用，以实际调用为准；
+> ③ 免费额度只覆盖 `glm-4-flash`（对话）、`glm-4v-flash`（视觉）、`cogview-3-flash`（文生图），
+> 其余模型（`glm-4.6`、`glm-5.3-flash`、`cogview-3`、`cogtts` 等）统一返回
+> `429 余额不足或无可用资源包,请充值。`——这是账号计费状态，不是网关问题。
 
 > **两个容易踩的上游约束**（实测踩到过，已固化进适配器与假上游）：
 > 1. MiMo 的 TTS **必须**有 assistant 消息承载待合成文本，否则 `400 messages must contain an assistant role for TTS model`。
@@ -459,9 +496,16 @@ base_url      http://127.0.0.1:8080/v1
 | GET | `/v1/models/{id}` | 查某个模型会映射到哪个上游模型 |
 
 管理面（环回免登录，远程需令牌）：`/api/admin/` 下的
-`session`、`system`、`keys`（含 `reset-usage` / `rotate` / `secret`）、`channels`（含 `probe` / `models` / `reset-cooldown`）、
+`session`、`system`、`keys`（含 `reset-usage` / `rotate` / `secret`）、`channels`（含 `probe` / `models` / `reset-cooldown` / `models/preview`）、
 `services`（本地服务：`{id}/start|stop|restart|check`、`bulk/{action}`、`{id}/log`）、
-`models/map`（含 `import` / `resolve`）、`stats`（含 `logs` / `export.csv`）、`live`、`health`、`balance`（含 `refresh` / `history`）、`settings`。
+`models/map`（含 `import` / `resolve`）、`models/catalog`、`stats`（含 `logs` / `export.csv`）、`live`、`health`、`balance`（含 `refresh` / `history`）、`settings`。
+
+其中两个给「填模型名」用的接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/admin/channels/models/preview` | 按**还没落库**的表单值（`provider_type` / `base_url` / `api_key`）拉一次上游 `/models`；`api_key` 留空且给了 `channel_id` 时沿用库里那把密钥。新建渠道时用 |
+| GET | `/api/admin/models/catalog` | 按渠道分组返回模型目录（每个渠道的白名单 + 上游真实 id + 取回时间 + 失败原因），`?refresh=true` 强制并发刷新。默认走缓存，TTL 是设置里的 `services.catalog_ttl_seconds`（600 秒） |
 
 运维探针：`/healthz`（存活）、`/readyz`（就绪）。交互式接口文档：`/docs`。
 
@@ -514,11 +558,34 @@ tail -f "%LOCALAPPDATA%\airelay\logs\airelay.log"   # Windows
 | 403 `MODEL_NOT_ALLOWED` | 该本地 Key 的「允许模型」白名单不包含请求的模型名（别名也算） |
 | 429 `QUOTA_EXCEEDED` / `RATE_LIMITED` | 配额用尽或触发 RPM/TPM；响应头 `Retry-After` 是建议等待秒数 |
 | 503 `NO_CHANNEL_AVAILABLE` | 没有渠道服务该模型：看渠道白名单是否放开、渠道是否都在冷却中；用「模型别名 → 路由试算」直接定位 |
-| 502 `UPSTREAM_ERROR` | 上游返回错误：看渠道的「最近错误」与探针结果，必要时核对上游密钥与 base_url |
+| 502 `UPSTREAM_ERROR` | 上游返回错误：把鼠标停在渠道列表「健康」列的徽记上看最近错误原文与发生时间，再配合「探针」结果，必要时核对上游密钥与 base_url |
 | 流式突然中断 | 上游静默超过「流式静默超时」或超过「请求总超时」；调大这两个值，或检查渠道稳定性 |
 | 改了端口没生效 | 前台/容器方式运行时需要在外部重启进程；托盘或进程内宿主方式会自动重绑定 |
+| 控制台点了按钮没反应 | 多半是前端脚本抛了异常（页面上会弹一条「界面报错」提示，内容即异常信息）；把这条内容发出来，或按 F12 看控制台堆栈 |
+| 下拉候选里看不到某个模型 | 候选按渠道分组，先看那组的标题：写「上游列表没拉到：原因」就点面板右下角「刷新上游模型」看具体报错（常见是上游 `/models` 需要鉴权或该协议不支持）；写「已禁用」说明渠道被停用了。都不行就直接手输模型名，白名单不依赖候选 |
 
 控制台上每个请求都能看到 `X-Request-Id`，配合「用量统计 → 请求明细」可以直接对上号。
+
+---
+
+## 性能约定（改这几处代码前先读）
+
+网关的管理面和协议面跑在**同一个事件循环**上。只要有人在 `/v1` 上跑长回答，控制台就得靠这个循环
+才能响应——所以下面三条不是优化建议，而是防止「控制台打不开」的硬约束。
+
+1. **流式路径上禁止「每块重算全文」**。统计已产出 token 请用 `TokenCounter` 增量累加，
+   不要写成 `estimate_tokens("".join(accumulated))`：那是 O(块数 × 全文长度)，一次 1200 块的长回答
+   要重复扫描几千万字符，纯 Python 字符循环会把事件循环占满（`tests/test_gateway.py` 里有一条
+   回归测试专门数「实际被扫描的字符数」，它必须正好等于回答长度）。
+2. **实时推送的 tick 要节流**。每个流式块都会触发一次状态变化，`LiveRegistry` 只按
+   `TICK_MIN_INTERVAL_SECONDS`（0.2s）发轻量 tick；控制台面板走的是「按固定间隔推完整快照」，
+   tick 只是提示，攒着发不影响观感。
+3. **控制台的前端资源必须能失效**。`/admin` 的 HTML 是 `no-store`，`/static/*` 是 `no-cache`
+   且在 HTML 里带 `?v=<前端文件 mtime>`：这样升级或重启之后，控制台窗口立刻用上新前端，
+   不会出现「新后端配旧前端」这种最难查的组合。
+
+前端刷新策略：统计类页面每 5 秒拉一次数据，用「请求数/错误数/token 总量…」组成的指纹判断有没有变化，
+**没变化就不重绘**（避免图表整片闪动）；标签页在后台时不发请求，切回前台立刻补一帧。
 
 ---
 

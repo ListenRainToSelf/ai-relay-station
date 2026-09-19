@@ -328,6 +328,29 @@ def _float(value: Any) -> float:
         return 0.0
 
 
+class ZhipuAdapter(OpenAIAdapter):
+    """智谱 GLM（BigModel 开放平台）。
+
+    协议是 OpenAI 兼容，唯一特别的是端点前缀 /api/paas/v4——版本段是 v4
+    而不是 v1，所以默认 base_url 必须给全（join_url 已能识别任意版本段，
+    用户手填 `.../api/paas/v4` 甚至整条端点 URL 也都落到同一处）。
+
+    能力按实测端点声明：
+    - chat        glm-4-flash / glm-4.5 / glm-5 系列
+    - vision      仅 glm-4v-* 系列接受图片；glm-4.5 等纯文本模型会由上游报错
+    - images      cogview-*（/images/generations）
+    - speech      /audio/speech，模型要用 cogtts（glm-4-voice 不是 TTS 模型）
+    - transcription /audio/transcriptions
+    音色不预置白名单（voices 为空），因为智谱的音色名随账号与模型变化，
+    写死会误拦；上游不认识时会把 1214「音色不存在」原样透传回来。
+    """
+
+    provider_type = "zhipu"
+    label = "智谱 GLM"
+    default_base_url = "https://open.bigmodel.cn/api/paas/v4"
+    capabilities = (CAP_CHAT, CAP_VISION, CAP_IMAGES, CAP_SPEECH, CAP_TRANSCRIPTION)
+
+
 class GenericOpenAIAdapter(OpenAIAdapter):
     """任意 OpenAI 兼容上游：base_url 必填，可配置自定义余额 URL。"""
 

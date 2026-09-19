@@ -336,6 +336,8 @@ async def test_settings_get_schema_and_update(client, admin_headers, ctx) -> Non
     groups = {group["group"] for group in body["schema"]}
     assert {"network", "gateway", "ratelimit", "monitoring", "balance", "pricing", "logs", "ui"} <= groups
     assert body["restart_managed"] is False
+    # 模型候选目录的缓存时长必须是「声明过的」设置项，否则控制台改不了它（读到的一直是默认值）
+    assert body["values"]["services.catalog_ttl_seconds"] == 600
 
     updated = await client.put(
         f"{ADMIN}/settings",
@@ -628,3 +630,98 @@ async def test_rotate_key_value_keeps_config_and_usage(client, admin_headers, ct
 async def test_rotate_unknown_key_returns_404(client, admin_headers) -> None:
     response = await client.post(f"{ADMIN}/keys/key_not_exists/rotate", headers=admin_headers)
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 模型目录与「新建渠道时拉上游列表」
+# --------------------------------------------------------------------------- #
+
+async def test_models_preview_works_without_a_saved_channel(client, admin_headers, mock_upstream) -> None:
+    """新建渠道时渠道 id 还不存在，也要能拉上游列表——白名单就是照着它填的。"""
+    response = await client.post(
+        f"{ADMIN}/channels/models/preview",
+        json={"provider_type": "openai", "base_url": mock_upstream, "api_key": "sk-x"},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == ["mock-gpt-large", "mock-gpt-small"]
+
+
+async def test_models_preview_reports_upstream_error(client, admin_headers, mock_upstream, mock_state) -> None:
+    mock_state.STATE["fail_times"] = 1
+    mock_state.STATE["fail_status"] = 401
+    response = await client.post(
+        f"{ADMIN}/channels/models/preview",
+        json={"provider_type": "openai", "base_url": mock_upstream, "api_key": "sk-bad"},
+        headers=admin_headers,
+    )
+    # 取模型列表这条路径把上游的鉴权失败也归一化成 502 UPSTREAM_ERROR
+    # （与单渠道 /channels/{id}/models 的行为一致），报文里带上游原文便于定位
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["ok"] is False and payload["code"] == "UPSTREAM_ERROR"
+    assert payload["message"]
+
+
+async def test_models_preview_reuses_saved_key_when_blank(
+    client, admin_headers, ctx, mock_upstream, mock_state
+) -> None:
+    """编辑已有渠道时密钥框留空表示「不修改」，预览要沿用库里那把密钥。"""
+    await create_channel(ctx, name="preview-key", provider_type="openai", base_url=mock_upstream)
+    channel_id = (await client.get(f"{ADMIN}/channels", headers=admin_headers)).json()["items"][0]["channel_id"]
+    mock_state.STATE["calls"].clear()
+
+    response = await client.post(
+        f"{ADMIN}/channels/models/preview",
+        json={"provider_type": "openai", "base_url": mock_upstream, "api_key": "", "channel_id": channel_id},
+        headers=admin_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+
+
+async def test_models_catalog_groups_by_channel_and_refreshes(client, admin_headers, ctx, mock_upstream) -> None:
+    await create_channel(
+        ctx, name="目录渠道", provider_type="openai", base_url=mock_upstream, models=["mock-gpt-*"]
+    )
+    async with ctx.session_factory() as session:
+        await ctx.mapping.create(session, {"alias": "fast", "upstream_model": "mock-gpt-small"})
+
+    # 没刷新过：只有白名单与别名，上游列表还是空的（不阻塞打开表单）
+    cold = await client.get(f"{ADMIN}/models/catalog", headers=admin_headers)
+    assert cold.status_code == 200
+    payload = cold.json()
+    entry = payload["channels"][0]
+    assert entry["models"] == ["mock-gpt-*"]
+    assert entry["upstream"] == []
+    assert "fast" in payload["models"] and "mock-gpt-small" in payload["models"]
+
+    # 刷新：拿到上游真实 id，且进了全集与缓存
+    warm = await client.get(f"{ADMIN}/models/catalog?refresh=true", headers=admin_headers)
+    entry = warm.json()["channels"][0]
+    assert [item["id"] for item in entry["upstream"]] == ["mock-gpt-large", "mock-gpt-small"]
+    assert entry["upstream_error"] == ""
+    assert "mock-gpt-large" in warm.json()["models"]
+
+    # 再次不刷新：直接读缓存，仍然有值
+    cached = await client.get(f"{ADMIN}/models/catalog", headers=admin_headers)
+    assert [item["id"] for item in cached.json()["channels"][0]["upstream"]] == [
+        "mock-gpt-large",
+        "mock-gpt-small",
+    ]
+
+
+async def test_models_catalog_keeps_going_when_one_channel_fails(
+    client, admin_headers, ctx, mock_upstream, mock_state
+) -> None:
+    """一个渠道拉不到（离线/限流）不该让整张目录空掉。"""
+    await create_channel(ctx, name="好的", provider_type="openai", base_url=mock_upstream)
+    await create_channel(ctx, name="坏的", provider_type="openai", base_url="http://127.0.0.1:9/v1", timeout=1.0)
+
+    response = await client.get(f"{ADMIN}/models/catalog?refresh=true", headers=admin_headers)
+    assert response.status_code == 200
+    by_name = {entry["name"]: entry for entry in response.json()["channels"]}
+    assert [item["id"] for item in by_name["好的"]["upstream"]] == ["mock-gpt-large", "mock-gpt-small"]
+    assert by_name["好的"]["upstream_error"] == ""
+    assert by_name["坏的"]["upstream_error"], "失败渠道要带上原因"
+    assert by_name["坏的"]["upstream"] == []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -153,6 +154,70 @@ async def test_stream_passthrough_emits_sse_with_usage(client, ctx, mock_upstrea
     snapshot = ctx.live.snapshot()
     assert snapshot["stats"]["active"] == 0
     assert snapshot["recent"], "完成的会话应出现在最近请求里"
+
+
+async def test_stream_token_estimate_scans_each_char_once(client, ctx, mock_upstream, mock_state) -> None:
+    """流式每块的 token 统计必须是「增量」的，不能每块重算全文。
+
+    老实现每收一块就 `"".join(已收文本)` 再 estimate_tokens(全文)，成本是
+    「块数 × 全文长度」。日志里真实流量的形状是 4.4 万~13.9 万 token、上千块，
+    四个并发就能把事件循环占满——表现就是「调用 API 时控制台页面打不开」。
+
+    这里数的是「实际被扫描的字符数」而不是墙钟时间：它必须正好等于回答总长度
+    （每个字符只处理一次），在旧实现下会是「各块前缀长度之和」，直接翻几十倍。
+    """
+    mock_state.STATE["stream_chunks"] = 1200
+    mock_state.STATE["stream_delay"] = 0.0
+    # 一次长回答：1200 块 × 每块几十字。旧实现要扫描「各块前缀之和」≈ 七百万字符
+    mock_state.STATE["reply_text"] = "秋天的山林里落叶铺满了小路，风从谷底吹上来带着松脂的气味。" * 2600
+    await create_channel(ctx, name="openai-linear", provider_type="openai", base_url=mock_upstream)
+    _, plaintext = await create_key(ctx, name="k-linear")
+
+    from airelay.adapters import base as adapters_base
+    from airelay import proxy as proxy_module
+
+    scanned = {"chars": 0, "calls": 0}
+    original_add = adapters_base.TokenCounter.add
+
+    def counting_add(self, text):
+        scanned["calls"] += 1
+        scanned["chars"] += len(text or "")
+        return original_add(self, text)
+
+    def forbidden_full_rescan(text):  # pragma: no cover - 走到这里就是回归了
+        raise AssertionError("流式路径不该再对全文重算 token")
+
+    with patch.object(adapters_base.TokenCounter, "add", counting_add), patch.object(
+        proxy_module, "estimate_tokens", forbidden_full_rescan
+    ):
+        async with client.stream(
+            "POST", CHAT, json=simple_body("fast", stream=True), headers=auth_header(plaintext)
+        ) as response:
+            assert response.status_code == 200
+            raw = "".join([chunk async for chunk in response.aiter_text()])
+
+    reply = "".join(
+        (choice.get("delta") or {}).get("content") or ""
+        for frame in raw.split("\n\n")
+        if frame.startswith("data: ")
+        for payload in [json.loads(frame[6:]) if frame[6:].strip() not in ("", "[DONE]") else {}]
+        for choice in payload.get("choices", [])
+    )
+    deltas = [
+        (choice.get("delta") or {}).get("content") or ""
+        for frame in raw.split("\n\n")
+        if frame.startswith("data: ")
+        for payload in [json.loads(frame[6:]) if frame[6:].strip() not in ("", "[DONE]") else {}]
+        for choice in payload.get("choices", [])
+    ]
+    assert reply == mock_state.STATE["reply_text"]
+    # 每个字符只被处理一次；旧实现这里会是各块前缀之和（数百万），差两百多倍
+    assert scanned["chars"] == len(reply), (
+        f"扫描了 {scanned['chars']} 个字符，回答只有 {len(reply)} 个字符——"
+        "说明又变成每块重算全文了"
+    )
+    # 每块正文对应一次增量累加，不重复、不遗漏
+    assert scanned["calls"] == len([piece for piece in deltas if piece])
 
 
 async def test_stream_forwards_upstream_usage_chunk_without_duplicating(
@@ -434,6 +499,28 @@ async def test_models_endpoint_lists_aliases(client, ctx, mock_upstream) -> None
     assert "fast" in ids
     detail = await client.get("/v1/models/fast", headers=auth_header(plaintext))
     assert detail.json()["upstream_model"] == "mock-gpt-small"
+
+
+async def test_models_endpoint_skips_glob_patterns(client, ctx, mock_upstream) -> None:
+    """白名单里的 glob 无法展开，不能当成模型名录出去；具体模型名照常列出。
+
+    渠道只写 `mock-*` 时 `/v1/models` 里看不到任何东西——智谱渠道配好却
+    「在客户端选不到模型」就是这么来的，所以这条规则固化成用例。
+    """
+    await create_channel(
+        ctx,
+        name="c-glob",
+        provider_type="openai",
+        base_url=mock_upstream,
+        models=["mock-*", "mock-gpt-exact"],
+    )
+    _, plaintext = await create_key(ctx, name="k-glob")
+    response = await client.get("/v1/models", headers=auth_header(plaintext))
+    assert response.status_code == 200
+    entries = {item["id"]: item for item in response.json()["data"]}
+    assert "mock-*" not in entries
+    assert "mock-gpt-exact" in entries
+    assert "chat" in entries["mock-gpt-exact"]["capabilities"]
 
 
 async def test_legacy_completions_maps_prompt_to_chat(client, ctx, mock_upstream, mock_state) -> None:
